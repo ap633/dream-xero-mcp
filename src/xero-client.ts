@@ -355,3 +355,345 @@ export async function getContact(contactIdOrName: string) {
   const response = await client.get(`/Contacts/${contactIdOrName}`);
   return response.data.Contacts?.[0] ?? null;
 }
+
+// ─── Credit Notes ─────────────────────────────────────────────────────────────
+
+export async function listCreditNotes(params: {
+  status?: string;
+  contactId?: string;
+  dateFrom?: string;
+  dateTo?: string;
+  page?: number;
+}) {
+  const client = await getApiClient();
+  const query: Record<string, string | number> = { page: params.page ?? 1 };
+  const where: string[] = [];
+  if (params.status) where.push(`Status=="${params.status}"`);
+  if (params.contactId) where.push(`Contact.ContactID=Guid("${params.contactId}")`);
+  if (where.length) query["where"] = where.join("&&");
+  if (params.dateFrom) query["fromDate"] = params.dateFrom;
+  if (params.dateTo) query["toDate"] = params.dateTo;
+  const response = await client.get("/CreditNotes", { params: query });
+  return response.data.CreditNotes ?? [];
+}
+
+export async function getCreditNote(creditNoteIdOrNumber: string) {
+  const client = await getApiClient();
+  const response = await client.get(`/CreditNotes/${creditNoteIdOrNumber}`);
+  return response.data.CreditNotes?.[0] ?? null;
+}
+
+// ─── Quotes ───────────────────────────────────────────────────────────────────
+
+export async function listQuotes(params: {
+  status?: string;
+  contactId?: string;
+  dateFrom?: string;
+  dateTo?: string;
+  page?: number;
+}) {
+  const client = await getApiClient();
+  const query: Record<string, string | number> = { page: params.page ?? 1 };
+  if (params.status) query["status"] = params.status;
+  if (params.contactId) query["ContactID"] = params.contactId;
+  if (params.dateFrom) query["DateFrom"] = params.dateFrom;
+  if (params.dateTo) query["DateTo"] = params.dateTo;
+  const response = await client.get("/Quotes", { params: query });
+  return response.data.Quotes ?? [];
+}
+
+export async function getQuote(quoteIdOrNumber: string) {
+  const client = await getApiClient();
+  const response = await client.get(`/Quotes/${quoteIdOrNumber}`);
+  return response.data.Quotes?.[0] ?? null;
+}
+
+// ─── Purchase Orders ──────────────────────────────────────────────────────────
+
+export async function listPurchaseOrders(params: {
+  status?: string;
+  dateFrom?: string;
+  dateTo?: string;
+  page?: number;
+}) {
+  const client = await getApiClient();
+  const query: Record<string, string | number> = { page: params.page ?? 1 };
+  if (params.status) query["status"] = params.status;
+  if (params.dateFrom) query["DateFrom"] = params.dateFrom;
+  if (params.dateTo) query["DateTo"] = params.dateTo;
+  const response = await client.get("/PurchaseOrders", { params: query });
+  return response.data.PurchaseOrders ?? [];
+}
+
+export async function getPurchaseOrder(purchaseOrderIdOrNumber: string) {
+  const client = await getApiClient();
+  const response = await client.get(`/PurchaseOrders/${purchaseOrderIdOrNumber}`);
+  return response.data.PurchaseOrders?.[0] ?? null;
+}
+
+// ─── Items (Products & Services) ─────────────────────────────────────────────
+
+export async function listItems(params: { searchTerm?: string }) {
+  const client = await getApiClient();
+  const query: Record<string, string> = {};
+  if (params.searchTerm) query["searchTerm"] = params.searchTerm;
+  const response = await client.get("/Items", { params: query });
+  return response.data.Items ?? [];
+}
+
+export async function getItem(itemIdOrCode: string) {
+  const client = await getApiClient();
+  const response = await client.get(`/Items/${itemIdOrCode}`);
+  return response.data.Items?.[0] ?? null;
+}
+
+// ─── Tracking Categories ──────────────────────────────────────────────────────
+
+export async function listTrackingCategories() {
+  const client = await getApiClient();
+  const response = await client.get("/TrackingCategories", {
+    params: { includeArchived: false },
+  });
+  return response.data.TrackingCategories ?? [];
+}
+
+// ─── Tax Rates ────────────────────────────────────────────────────────────────
+
+export async function listTaxRates(params: { taxType?: string }) {
+  const client = await getApiClient();
+  const query: Record<string, string> = {};
+  if (params.taxType) query["where"] = `TaxType=="${params.taxType}"`;
+  const response = await client.get("/TaxRates", { params: query });
+  return response.data.TaxRates ?? [];
+}
+
+// ─── Manual Journals ──────────────────────────────────────────────────────────
+
+export async function listManualJournals(params: {
+  status?: string;
+  dateFrom?: string;
+  dateTo?: string;
+  page?: number;
+}) {
+  const client = await getApiClient();
+  const query: Record<string, string | number> = { page: params.page ?? 1 };
+  const where: string[] = [];
+  if (params.status) where.push(`Status=="${params.status}"`);
+  if (where.length) query["where"] = where.join("&&");
+  if (params.dateFrom) query["fromDate"] = params.dateFrom;
+  if (params.dateTo) query["toDate"] = params.dateTo;
+  const response = await client.get("/ManualJournals", { params: query });
+  return response.data.ManualJournals ?? [];
+}
+
+// ─── Repeating Invoices ───────────────────────────────────────────────────────
+
+export async function listRepeatingInvoices(params: { status?: string }) {
+  const client = await getApiClient();
+  const query: Record<string, string> = {};
+  if (params.status) query["where"] = `Status=="${params.status}"`;
+  const response = await client.get("/RepeatingInvoices", { params: query });
+  return response.data.RepeatingInvoices ?? [];
+}
+
+// ─── Overpayments & Prepayments ───────────────────────────────────────────────
+
+export async function listOverpayments(params: {
+  contactId?: string;
+  dateFrom?: string;
+  dateTo?: string;
+  page?: number;
+}) {
+  const client = await getApiClient();
+  const query: Record<string, string | number> = { page: params.page ?? 1 };
+  const where: string[] = [];
+  if (params.contactId) where.push(`Contact.ContactID=Guid("${params.contactId}")`);
+  if (where.length) query["where"] = where.join("&&");
+  if (params.dateFrom) query["fromDate"] = params.dateFrom;
+  if (params.dateTo) query["toDate"] = params.dateTo;
+  const response = await client.get("/Overpayments", { params: query });
+  return response.data.Overpayments ?? [];
+}
+
+export async function listPrepayments(params: {
+  contactId?: string;
+  dateFrom?: string;
+  dateTo?: string;
+  page?: number;
+}) {
+  const client = await getApiClient();
+  const query: Record<string, string | number> = { page: params.page ?? 1 };
+  const where: string[] = [];
+  if (params.contactId) where.push(`Contact.ContactID=Guid("${params.contactId}")`);
+  if (where.length) query["where"] = where.join("&&");
+  if (params.dateFrom) query["fromDate"] = params.dateFrom;
+  if (params.dateTo) query["toDate"] = params.dateTo;
+  const response = await client.get("/Prepayments", { params: query });
+  return response.data.Prepayments ?? [];
+}
+
+// ─── Extended Reports ─────────────────────────────────────────────────────────
+
+export async function getAgedReceivables(params: {
+  contactId?: string;
+  date?: string;
+  fromDate?: string;
+  toDate?: string;
+}) {
+  const client = await getApiClient();
+  const query: Record<string, string> = {};
+  if (params.contactId) query["contactID"] = params.contactId;
+  if (params.date) query["date"] = params.date;
+  if (params.fromDate) query["fromDate"] = params.fromDate;
+  if (params.toDate) query["toDate"] = params.toDate;
+  const response = await client.get("/Reports/AgedReceivablesByContact", { params: query });
+  return response.data.Reports?.[0] ?? null;
+}
+
+export async function getAgedPayables(params: {
+  contactId?: string;
+  date?: string;
+  fromDate?: string;
+  toDate?: string;
+}) {
+  const client = await getApiClient();
+  const query: Record<string, string> = {};
+  if (params.contactId) query["contactID"] = params.contactId;
+  if (params.date) query["date"] = params.date;
+  if (params.fromDate) query["fromDate"] = params.fromDate;
+  if (params.toDate) query["toDate"] = params.toDate;
+  const response = await client.get("/Reports/AgedPayablesByContact", { params: query });
+  return response.data.Reports?.[0] ?? null;
+}
+
+export async function getTrialBalance(params: {
+  date?: string;
+  paymentsOnly?: boolean;
+}) {
+  const client = await getApiClient();
+  const query: Record<string, string | boolean> = {};
+  if (params.date) query["date"] = params.date;
+  if (params.paymentsOnly !== undefined) query["paymentsOnly"] = params.paymentsOnly;
+  const response = await client.get("/Reports/TrialBalance", { params: query });
+  return response.data.Reports?.[0] ?? null;
+}
+
+export async function getExecutiveSummary(params: { date?: string }) {
+  const client = await getApiClient();
+  const query: Record<string, string> = {};
+  if (params.date) query["date"] = params.date;
+  const response = await client.get("/Reports/ExecutiveSummary", { params: query });
+  return response.data.Reports?.[0] ?? null;
+}
+
+export async function getBankSummary(params: {
+  fromDate?: string;
+  toDate?: string;
+}) {
+  const client = await getApiClient();
+  const query: Record<string, string> = {};
+  if (params.fromDate) query["fromDate"] = params.fromDate;
+  if (params.toDate) query["toDate"] = params.toDate;
+  const response = await client.get("/Reports/BankSummary", { params: query });
+  return response.data.Reports?.[0] ?? null;
+}
+
+export async function getBudgetSummary(params: {
+  date?: string;
+  periods?: number;
+  timeframe?: number;
+}) {
+  const client = await getApiClient();
+  const query: Record<string, string | number> = {};
+  if (params.date) query["date"] = params.date;
+  if (params.periods) query["periods"] = params.periods;
+  if (params.timeframe) query["timeframe"] = params.timeframe;
+  const response = await client.get("/Reports/BudgetSummary", { params: query });
+  return response.data.Reports?.[0] ?? null;
+}
+
+export async function getGSTReport(params: {
+  fromDate?: string;
+  toDate?: string;
+}) {
+  const client = await getApiClient();
+  const query: Record<string, string> = {};
+  if (params.fromDate) query["fromDate"] = params.fromDate;
+  if (params.toDate) query["toDate"] = params.toDate;
+  // GST report endpoint — returns BAS/VAT summary
+  const response = await client.get("/Reports/GST", { params: query });
+  return response.data.Reports?.[0] ?? null;
+}
+
+// ─── Fixed Assets ─────────────────────────────────────────────────────────────
+// Assets API uses a different base URL
+
+export async function listAssets(params: {
+  status?: string;
+  page?: number;
+  pageSize?: number;
+}) {
+  const token = await getAccessToken();
+  // Ensure tenant is loaded
+  if (!activeTenantId) {
+    const tenants = await getTenants();
+    if (tenants.length === 0) throw new Error("No Xero organisations connected");
+    activeTenantId = tenants[0].tenantId;
+  }
+  const query: Record<string, string | number> = {
+    page: params.page ?? 1,
+    pageSize: params.pageSize ?? 100,
+  };
+  if (params.status) query["status"] = params.status;
+
+  const response = await axios.get("https://api.xero.com/assets.xro/1.0/Assets", {
+    params: query,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "xero-tenant-id": activeTenantId,
+      Accept: "application/json",
+    },
+  });
+  return response.data.items ?? response.data ?? [];
+}
+
+export async function getAssetSettings() {
+  const token = await getAccessToken();
+  if (!activeTenantId) {
+    const tenants = await getTenants();
+    if (tenants.length === 0) throw new Error("No Xero organisations connected");
+    activeTenantId = tenants[0].tenantId;
+  }
+  const response = await axios.get("https://api.xero.com/assets.xro/1.0/Settings", {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "xero-tenant-id": activeTenantId,
+      Accept: "application/json",
+    },
+  });
+  return response.data;
+}
+
+// ─── Contact Groups ───────────────────────────────────────────────────────────
+
+export async function listContactGroups() {
+  const client = await getApiClient();
+  const response = await client.get("/ContactGroups");
+  return response.data.ContactGroups ?? [];
+}
+
+// ─── Currencies ───────────────────────────────────────────────────────────────
+
+export async function listCurrencies() {
+  const client = await getApiClient();
+  const response = await client.get("/Currencies");
+  return response.data.Currencies ?? [];
+}
+
+// ─── Organisation Details ─────────────────────────────────────────────────────
+
+export async function getOrganisationDetails() {
+  const client = await getApiClient();
+  const response = await client.get("/Organisation");
+  return response.data.Organisations?.[0] ?? null;
+}

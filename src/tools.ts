@@ -401,4 +401,421 @@ export const tools: ToolDefinition[] = [
       return xero.getContact(contactIdOrName);
     },
   },
+
+  // ── Credit Notes ──────────────────────────────────────────────────────────
+  {
+    name: "xero_list_credit_notes",
+    description:
+      "List credit notes from Xero (both accounts receivable and accounts payable credit notes). Filter by status, contact, or date range.",
+    inputSchema: z.object({
+      status: z
+        .enum(["DRAFT", "SUBMITTED", "AUTHORISED", "PAID", "VOIDED", "DELETED"])
+        .optional()
+        .describe("Filter by credit note status"),
+      contactId: z.string().optional().describe("Filter by Contact GUID"),
+      dateFrom: z.string().optional().describe("Start date (YYYY-MM-DD)"),
+      dateTo: z.string().optional().describe("End date (YYYY-MM-DD)"),
+      page: z.number().int().min(1).default(1).describe("Page number"),
+    }),
+    handler: async (input) => {
+      return xero.listCreditNotes(input as Parameters<typeof xero.listCreditNotes>[0]);
+    },
+  },
+
+  {
+    name: "xero_get_credit_note",
+    description:
+      "Get a single credit note by its CreditNoteID (GUID) or CreditNoteNumber. Returns full details including line items and allocations.",
+    inputSchema: z.object({
+      creditNoteIdOrNumber: z.string().describe("Credit Note ID (GUID) or Credit Note Number"),
+    }),
+    handler: async (input) => {
+      const { creditNoteIdOrNumber } = input as { creditNoteIdOrNumber: string };
+      return xero.getCreditNote(creditNoteIdOrNumber);
+    },
+  },
+
+  // ── Quotes ────────────────────────────────────────────────────────────────
+  {
+    name: "xero_list_quotes",
+    description:
+      "List quotes/proposals from Xero. Shows sales quotes sent to customers with status (DRAFT, SENT, DECLINED, ACCEPTED, INVOICED, DELETED).",
+    inputSchema: z.object({
+      status: z
+        .enum(["DRAFT", "SENT", "DECLINED", "ACCEPTED", "INVOICED", "DELETED"])
+        .optional()
+        .describe("Filter by quote status"),
+      contactId: z.string().optional().describe("Filter by Contact GUID"),
+      dateFrom: z.string().optional().describe("Quote date from (YYYY-MM-DD)"),
+      dateTo: z.string().optional().describe("Quote date to (YYYY-MM-DD)"),
+      page: z.number().int().min(1).default(1).describe("Page number"),
+    }),
+    handler: async (input) => {
+      return xero.listQuotes(input as Parameters<typeof xero.listQuotes>[0]);
+    },
+  },
+
+  {
+    name: "xero_get_quote",
+    description:
+      "Get a single quote by its QuoteID (GUID) or QuoteNumber. Returns full quote details including line items, expiry date, and terms.",
+    inputSchema: z.object({
+      quoteIdOrNumber: z.string().describe("Quote ID (GUID) or Quote Number"),
+    }),
+    handler: async (input) => {
+      const { quoteIdOrNumber } = input as { quoteIdOrNumber: string };
+      return xero.getQuote(quoteIdOrNumber);
+    },
+  },
+
+  // ── Purchase Orders ───────────────────────────────────────────────────────
+  {
+    name: "xero_list_purchase_orders",
+    description:
+      "List purchase orders from Xero. Filter by status (DRAFT, AUTHORISED, BILLED, DELETED) or date range.",
+    inputSchema: z.object({
+      status: z
+        .enum(["DRAFT", "AUTHORISED", "BILLED", "DELETED"])
+        .optional()
+        .describe("Filter by purchase order status"),
+      dateFrom: z.string().optional().describe("From date (YYYY-MM-DD)"),
+      dateTo: z.string().optional().describe("To date (YYYY-MM-DD)"),
+      page: z.number().int().min(1).default(1).describe("Page number"),
+    }),
+    handler: async (input) => {
+      return xero.listPurchaseOrders(input as Parameters<typeof xero.listPurchaseOrders>[0]);
+    },
+  },
+
+  {
+    name: "xero_get_purchase_order",
+    description:
+      "Get a single purchase order by its PurchaseOrderID (GUID) or PurchaseOrderNumber. Returns full details including line items and delivery address.",
+    inputSchema: z.object({
+      purchaseOrderIdOrNumber: z.string().describe("Purchase Order ID (GUID) or PO Number"),
+    }),
+    handler: async (input) => {
+      const { purchaseOrderIdOrNumber } = input as { purchaseOrderIdOrNumber: string };
+      return xero.getPurchaseOrder(purchaseOrderIdOrNumber);
+    },
+  },
+
+  // ── Items ─────────────────────────────────────────────────────────────────
+  {
+    name: "xero_list_items",
+    description:
+      "List products and services (items) set up in Xero. Returns item code, name, description, unit price, account codes, and tax type. Used on invoices and bills.",
+    inputSchema: z.object({
+      searchTerm: z.string().optional().describe("Search items by code or name"),
+    }),
+    handler: async (input) => {
+      return xero.listItems(input as Parameters<typeof xero.listItems>[0]);
+    },
+  },
+
+  {
+    name: "xero_get_item",
+    description:
+      "Get a single item (product/service) by its ItemID (GUID) or ItemCode. Returns pricing, account codes, and purchase/sales details.",
+    inputSchema: z.object({
+      itemIdOrCode: z.string().describe("Item ID (GUID) or Item Code"),
+    }),
+    handler: async (input) => {
+      const { itemIdOrCode } = input as { itemIdOrCode: string };
+      return xero.getItem(itemIdOrCode);
+    },
+  },
+
+  // ── Tracking Categories ───────────────────────────────────────────────────
+  {
+    name: "xero_list_tracking_categories",
+    description:
+      "List tracking categories and their options from Xero. Tracking categories allow transactions to be tagged for departmental or project reporting (e.g. 'Region', 'Department').",
+    inputSchema: z.object({}),
+    handler: async () => {
+      return xero.listTrackingCategories();
+    },
+  },
+
+  // ── Tax Rates ─────────────────────────────────────────────────────────────
+  {
+    name: "xero_list_tax_rates",
+    description:
+      "List tax rates configured in Xero. Returns tax type code, name, effective rate, and status. Essential for understanding GST/tax codes used on invoices and bills.",
+    inputSchema: z.object({
+      taxType: z
+        .string()
+        .optional()
+        .describe("Filter by tax type (e.g. OUTPUT, INPUT, GSTONIMPORTS, EXEMPTOUTPUT)"),
+    }),
+    handler: async (input) => {
+      return xero.listTaxRates(input as Parameters<typeof xero.listTaxRates>[0]);
+    },
+  },
+
+  // ── Manual Journals ───────────────────────────────────────────────────────
+  {
+    name: "xero_list_manual_journals",
+    description:
+      "List manual journal entries from Xero. Returns manually created journal adjustments including narration, date, and debit/credit lines.",
+    inputSchema: z.object({
+      status: z
+        .enum(["DRAFT", "POSTED", "DELETED", "VOIDED"])
+        .optional()
+        .describe("Filter by journal status"),
+      dateFrom: z.string().optional().describe("From date (YYYY-MM-DD)"),
+      dateTo: z.string().optional().describe("To date (YYYY-MM-DD)"),
+      page: z.number().int().min(1).default(1).describe("Page number"),
+    }),
+    handler: async (input) => {
+      return xero.listManualJournals(input as Parameters<typeof xero.listManualJournals>[0]);
+    },
+  },
+
+  // ── Repeating Invoices ────────────────────────────────────────────────────
+  {
+    name: "xero_list_repeating_invoices",
+    description:
+      "List repeating invoice templates from Xero. Shows recurring billing schedules including frequency, next scheduled date, and amounts.",
+    inputSchema: z.object({
+      status: z
+        .enum(["AUTHORISED", "DELETED"])
+        .optional()
+        .describe("Filter by repeating invoice status"),
+    }),
+    handler: async (input) => {
+      return xero.listRepeatingInvoices(input as Parameters<typeof xero.listRepeatingInvoices>[0]);
+    },
+  },
+
+  // ── Overpayments & Prepayments ────────────────────────────────────────────
+  {
+    name: "xero_list_overpayments",
+    description:
+      "List overpayments recorded in Xero (payments received or made in excess of the invoice amount). Shows remaining credit available to allocate.",
+    inputSchema: z.object({
+      contactId: z.string().optional().describe("Filter by Contact GUID"),
+      dateFrom: z.string().optional().describe("From date (YYYY-MM-DD)"),
+      dateTo: z.string().optional().describe("To date (YYYY-MM-DD)"),
+      page: z.number().int().min(1).default(1).describe("Page number"),
+    }),
+    handler: async (input) => {
+      return xero.listOverpayments(input as Parameters<typeof xero.listOverpayments>[0]);
+    },
+  },
+
+  {
+    name: "xero_list_prepayments",
+    description:
+      "List prepayments from Xero (payments made or received before an invoice is issued). Shows balance remaining and any allocations to invoices.",
+    inputSchema: z.object({
+      contactId: z.string().optional().describe("Filter by Contact GUID"),
+      dateFrom: z.string().optional().describe("From date (YYYY-MM-DD)"),
+      dateTo: z.string().optional().describe("To date (YYYY-MM-DD)"),
+      page: z.number().int().min(1).default(1).describe("Page number"),
+    }),
+    handler: async (input) => {
+      return xero.listPrepayments(input as Parameters<typeof xero.listPrepayments>[0]);
+    },
+  },
+
+  // ── Extended Reports ──────────────────────────────────────────────────────
+  {
+    name: "xero_get_aged_receivables",
+    description:
+      "Retrieve the Aged Receivables report from Xero. Shows outstanding amounts owed by customers, broken into aging buckets (Current, 30, 60, 90+ days overdue). Critical for debtor management.",
+    inputSchema: z.object({
+      contactId: z
+        .string()
+        .optional()
+        .describe("Filter to a specific customer Contact GUID"),
+      date: z
+        .string()
+        .optional()
+        .describe("As-at date for aging calculation (YYYY-MM-DD). Defaults to today."),
+      fromDate: z.string().optional().describe("Show invoices from this date (YYYY-MM-DD)"),
+      toDate: z.string().optional().describe("Show invoices to this date (YYYY-MM-DD)"),
+    }),
+    handler: async (input) => {
+      return xero.getAgedReceivables(input as Parameters<typeof xero.getAgedReceivables>[0]);
+    },
+  },
+
+  {
+    name: "xero_get_aged_payables",
+    description:
+      "Retrieve the Aged Payables report from Xero. Shows outstanding amounts owed to suppliers, broken into aging buckets (Current, 30, 60, 90+ days overdue). Critical for creditor management.",
+    inputSchema: z.object({
+      contactId: z
+        .string()
+        .optional()
+        .describe("Filter to a specific supplier Contact GUID"),
+      date: z
+        .string()
+        .optional()
+        .describe("As-at date for aging calculation (YYYY-MM-DD). Defaults to today."),
+      fromDate: z.string().optional().describe("Show bills from this date (YYYY-MM-DD)"),
+      toDate: z.string().optional().describe("Show bills to this date (YYYY-MM-DD)"),
+    }),
+    handler: async (input) => {
+      return xero.getAgedPayables(input as Parameters<typeof xero.getAgedPayables>[0]);
+    },
+  },
+
+  {
+    name: "xero_get_trial_balance",
+    description:
+      "Retrieve the Trial Balance report from Xero. Shows all GL account balances (debit and credit) as at a specified date. Standard check that debits equal credits.",
+    inputSchema: z.object({
+      date: z
+        .string()
+        .optional()
+        .describe("As-at date for the trial balance (YYYY-MM-DD). Defaults to today."),
+      paymentsOnly: z
+        .boolean()
+        .optional()
+        .describe("If true, shows cash-basis balances (payments only, no accruals)"),
+    }),
+    handler: async (input) => {
+      return xero.getTrialBalance(input as Parameters<typeof xero.getTrialBalance>[0]);
+    },
+  },
+
+  {
+    name: "xero_get_executive_summary",
+    description:
+      "Retrieve the Executive Summary report from Xero. Provides a high-level KPI dashboard including revenue, gross profit, net profit, cash position, and key ratios for the selected month.",
+    inputSchema: z.object({
+      date: z
+        .string()
+        .optional()
+        .describe("Month to report on — any date within that month (YYYY-MM-DD). Defaults to current month."),
+    }),
+    handler: async (input) => {
+      return xero.getExecutiveSummary(input as Parameters<typeof xero.getExecutiveSummary>[0]);
+    },
+  },
+
+  {
+    name: "xero_get_bank_summary",
+    description:
+      "Retrieve the Bank Summary report from Xero. Shows opening and closing balances for all bank accounts, plus total receipts and payments for the period.",
+    inputSchema: z.object({
+      fromDate: z.string().optional().describe("Period start date (YYYY-MM-DD)"),
+      toDate: z.string().optional().describe("Period end date (YYYY-MM-DD)"),
+    }),
+    handler: async (input) => {
+      return xero.getBankSummary(input as Parameters<typeof xero.getBankSummary>[0]);
+    },
+  },
+
+  {
+    name: "xero_get_budget_summary",
+    description:
+      "Retrieve the Budget Summary report from Xero. Compares actual income and expenses against budgeted amounts for the period.",
+    inputSchema: z.object({
+      date: z.string().optional().describe("Period start date (YYYY-MM-DD)"),
+      periods: z
+        .number()
+        .int()
+        .min(1)
+        .max(12)
+        .optional()
+        .describe("Number of periods to include (1–12)"),
+      timeframe: z
+        .number()
+        .int()
+        .optional()
+        .describe("Timeframe in months per period (1 = monthly, 3 = quarterly, 12 = annual)"),
+    }),
+    handler: async (input) => {
+      return xero.getBudgetSummary(input as Parameters<typeof xero.getBudgetSummary>[0]);
+    },
+  },
+
+  {
+    name: "xero_get_gst_report",
+    description:
+      "Retrieve the GST / BAS (Business Activity Statement) report from Xero. Shows GST collected on sales, GST paid on purchases, and the net GST payable or refundable for the period. Essential for Australian BAS lodgement.",
+    inputSchema: z.object({
+      fromDate: z
+        .string()
+        .optional()
+        .describe("BAS period start date (YYYY-MM-DD)"),
+      toDate: z
+        .string()
+        .optional()
+        .describe("BAS period end date (YYYY-MM-DD)"),
+    }),
+    handler: async (input) => {
+      return xero.getGSTReport(input as Parameters<typeof xero.getGSTReport>[0]);
+    },
+  },
+
+  // ── Fixed Assets ──────────────────────────────────────────────────────────
+  {
+    name: "xero_list_assets",
+    description:
+      "List fixed assets from Xero's asset register. Returns asset name, asset number, purchase date, purchase price, depreciation method, and book value. Filter by status (DRAFT, REGISTERED, DISPOSED).",
+    inputSchema: z.object({
+      status: z
+        .enum(["DRAFT", "REGISTERED", "DISPOSED"])
+        .optional()
+        .describe("Filter by asset status"),
+      page: z.number().int().min(1).default(1).describe("Page number"),
+      pageSize: z
+        .number()
+        .int()
+        .min(1)
+        .max(100)
+        .default(100)
+        .describe("Records per page (max 100)"),
+    }),
+    handler: async (input) => {
+      return xero.listAssets(input as Parameters<typeof xero.listAssets>[0]);
+    },
+  },
+
+  {
+    name: "xero_get_asset_settings",
+    description:
+      "Get the fixed asset settings for the Xero organisation. Returns default depreciation accounts, asset account, and depreciation method defaults.",
+    inputSchema: z.object({}),
+    handler: async () => {
+      return xero.getAssetSettings();
+    },
+  },
+
+  // ── Contact Groups ────────────────────────────────────────────────────────
+  {
+    name: "xero_list_contact_groups",
+    description:
+      "List contact groups from Xero. Contact groups are used to categorise contacts (e.g. 'VIP Clients', 'Contractors'). Returns group name and member contacts.",
+    inputSchema: z.object({}),
+    handler: async () => {
+      return xero.listContactGroups();
+    },
+  },
+
+  // ── Currencies ────────────────────────────────────────────────────────────
+  {
+    name: "xero_list_currencies",
+    description:
+      "List currencies enabled in the Xero organisation. Returns currency code and description. Useful for multi-currency clients.",
+    inputSchema: z.object({}),
+    handler: async () => {
+      return xero.listCurrencies();
+    },
+  },
+
+  // ── Organisation ──────────────────────────────────────────────────────────
+  {
+    name: "xero_get_organisation",
+    description:
+      "Get organisation details for the active Xero tenant. Returns the organisation name, ABN/tax number, financial year end, accounting basis (cash/accrual), base currency, and timezone.",
+    inputSchema: z.object({}),
+    handler: async () => {
+      return xero.getOrganisationDetails();
+    },
+  },
 ];
