@@ -1,6 +1,6 @@
 {
   "name": "dream-xero-mcp",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Xero MCP server for Dream Accounting — exposes Xero accounting data as MCP tools",
   "main": "dist/index.js",
   "scripts": {

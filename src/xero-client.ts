@@ -1,12 +1,25 @@
 import axios, { AxiosInstance } from "axios";
 
 const XERO_TOKEN_URL = "https://identity.xero.com/connect/token";
+const XERO_AUTHORIZE_URL = "https://login.xero.com/identity/connect/authorize";
 const XERO_API_BASE = "https://api.xero.com/api.xro/2.0";
 const XERO_CONNECTIONS_URL = "https://api.xero.com/connections";
 
+const DEFAULT_SCOPES = [
+  "accounting.transactions",
+  "accounting.transactions.read",
+  "accounting.contacts",
+  "accounting.contacts.read",
+  "accounting.reports.read",
+  "accounting.journals.read",
+  "accounting.settings",
+  "accounting.settings.read",
+];
+
 interface TokenCache {
   accessToken: string;
-  expiresAt: number; // Unix ms timestamp
+  expiresAt: number;
+  refreshToken?: string;
 }
 
 interface XeroTenant {
@@ -18,42 +31,43 @@ interface XeroTenant {
   updatedDateUtc: string;
 }
 
+export function isOAuthMode(): boolean {
+  return Boolean(process.env.XERO_OAUTH_CLIENT_ID);
+}
+
+function getOAuthRedirectUri(): string {
+  return (
+    process.env.XERO_OAUTH_REDIRECT_URI ||
+    "https://dream-xero-mcp-production.up.railway.app/callback"
+  );
+}
+
+function getScopes(): string[] {
+  if (process.env.XERO_SCOPES) {
+    return process.env.XERO_SCOPES.split(/\s+/).filter(Boolean);
+  }
+  return isOAuthMode()
+    ? ["offline_access", "openid", "profile", "email", ...DEFAULT_SCOPES]
+    : DEFAULT_SCOPES;
+}
+
 let tokenCache: TokenCache | null = null;
-
-// Active tenant chosen by user (defaults to first available)
-let activeTenantId: string | null = null;
 let tenantsCache: XeroTenant[] | null = null;
+let tenantsCacheExpiresAt = 0;
+let activeTenantId: string | null = null;
 
-// ─── Token Management ────────────────────────────────────────────────────────
-
-async function fetchAccessToken(): Promise<string> {
+async function fetchCustomConnectionToken(): Promise<string> {
   const clientId = process.env.XERO_CLIENT_ID;
   const clientSecret = process.env.XERO_CLIENT_SECRET;
-
   if (!clientId || !clientSecret) {
-    throw new Error(
-      "XERO_CLIENT_ID and XERO_CLIENT_SECRET environment variables are required"
-    );
+    throw new Error("Custom Connection requires XERO_CLIENT_ID and XERO_CLIENT_SECRET.");
   }
-
-  const credentials = Buffer.from(`${clientId}:${clientSecret}`).toString(
-    "base64"
-  );
-
+  const credentials = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
   const response = await axios.post(
     XERO_TOKEN_URL,
     new URLSearchParams({
       grant_type: "client_credentials",
-      scope: [
-        "accounting.transactions",
-        "accounting.transactions.read",
-        "accounting.contacts",
-        "accounting.contacts.read",
-        "accounting.reports.read",
-        "accounting.journals.read",
-        "accounting.settings",
-        "accounting.settings.read",
-      ].join(" "),
+      scope: DEFAULT_SCOPES.join(" "),
     }),
     {
       headers: {
@@ -62,70 +76,123 @@ async function fetchAccessToken(): Promise<string> {
       },
     }
   );
-
   const { access_token, expires_in } = response.data;
+  tokenCache = { accessToken: access_token, expiresAt: Date.now() + (expires_in - 60) * 1000 };
+  return access_token;
+}
+
+export function buildAuthorizeUrl(state: string): string {
+  const clientId = process.env.XERO_OAUTH_CLIENT_ID;
+  if (!clientId) throw new Error("XERO_OAUTH_CLIENT_ID is not set.");
+  const params = new URLSearchParams({
+    response_type: "code",
+    client_id: clientId,
+    redirect_uri: getOAuthRedirectUri(),
+    scope: getScopes().join(" "),
+    state,
+  });
+  return `${XERO_AUTHORIZE_URL}?${params.toString()}`;
+}
+
+export async function exchangeCodeForTokens(code: string): Promise<{
+  accessToken: string;
+  refreshToken: string;
+  expiresIn: number;
+  tenantCount: number;
+}> {
+  const clientId = process.env.XERO_OAUTH_CLIENT_ID;
+  const clientSecret = process.env.XERO_OAUTH_CLIENT_SECRET;
+  if (!clientId || !clientSecret) {
+    throw new Error("OAuth requires XERO_OAUTH_CLIENT_ID and XERO_OAUTH_CLIENT_SECRET.");
+  }
+  const credentials = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
+  const response = await axios.post(
+    XERO_TOKEN_URL,
+    new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: getOAuthRedirectUri(),
+    }),
+    {
+      headers: {
+        Authorization: `Basic ${credentials}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+    }
+  );
+  const { access_token, refresh_token, expires_in } = response.data;
   tokenCache = {
     accessToken: access_token,
-    expiresAt: Date.now() + (expires_in - 60) * 1000, // 60s buffer
+    refreshToken: refresh_token,
+    expiresAt: Date.now() + (expires_in - 60) * 1000,
   };
+  // Force-refresh tenant list now that we have a fresh OAuth token
+  tenantsCache = null;
+  tenantsCacheExpiresAt = 0;
+  const tenants = await getTenants();
+  return {
+    accessToken: access_token,
+    refreshToken: refresh_token,
+    expiresIn: expires_in,
+    tenantCount: tenants.length,
+  };
+}
 
+async function refreshOAuthToken(): Promise<string> {
+  const clientId = process.env.XERO_OAUTH_CLIENT_ID;
+  const clientSecret = process.env.XERO_OAUTH_CLIENT_SECRET;
+  if (!clientId || !clientSecret) {
+    throw new Error("OAuth refresh requires XERO_OAUTH_CLIENT_ID and XERO_OAUTH_CLIENT_SECRET.");
+  }
+  if (!tokenCache?.refreshToken) {
+    throw new Error("No OAuth refresh token. Visit /auth/start to authorize.");
+  }
+  const credentials = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
+  const response = await axios.post(
+    XERO_TOKEN_URL,
+    new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: tokenCache.refreshToken,
+    }),
+    {
+      headers: {
+        Authorization: `Basic ${credentials}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+    }
+  );
+  const { access_token, refresh_token, expires_in } = response.data;
+  tokenCache = {
+    accessToken: access_token,
+    refreshToken: refresh_token || tokenCache.refreshToken,
+    expiresAt: Date.now() + (expires_in - 60) * 1000,
+  };
   return access_token;
 }
 
 async function getAccessToken(): Promise<string> {
-  if (tokenCache && Date.now() < tokenCache.expiresAt) {
-    return tokenCache.accessToken;
-  }
-  return fetchAccessToken();
+  if (tokenCache && Date.now() < tokenCache.expiresAt) return tokenCache.accessToken;
+  if (isOAuthMode()) return refreshOAuthToken();
+  return fetchCustomConnectionToken();
 }
 
-// ─── Axios Instance Factory ──────────────────────────────────────────────────
-
-async function getApiClient(tenantId?: string): Promise<AxiosInstance> {
-  const token = await getAccessToken();
-  const tid = tenantId || activeTenantId;
-
-  if (!tid) {
-    // Auto-discover and use first tenant
-    const tenants = await getTenants();
-    if (tenants.length === 0) {
-      throw new Error(
-        "No Xero organisations connected to this custom connection"
-      );
-    }
-    activeTenantId = tenants[0].tenantId;
-  }
-
-  return axios.create({
-    baseURL: XERO_API_BASE,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "xero-tenant-id": activeTenantId,
-      Accept: "application/json",
-      "Content-Type": "application/json",
-    },
-  });
-}
-
-// ─── Tenant / Organisation Tools ─────────────────────────────────────────────
+const TENANT_CACHE_TTL_MS = 5 * 60 * 1000;
 
 export async function getTenants(): Promise<XeroTenant[]> {
-  if (tenantsCache) return tenantsCache;
-
+  if (tenantsCache && Date.now() < tenantsCacheExpiresAt) return tenantsCache;
   const token = await getAccessToken();
   const response = await axios.get<XeroTenant[]>(XERO_CONNECTIONS_URL, {
     headers: { Authorization: `Bearer ${token}` },
   });
-
   tenantsCache = response.data;
-  if (tenantsCache.length > 0 && !activeTenantId) {
+  tenantsCacheExpiresAt = Date.now() + TENANT_CACHE_TTL_MS;
+  if (!isOAuthMode() && tenantsCache.length > 0 && !activeTenantId) {
     activeTenantId = tenantsCache[0].tenantId;
   }
   return tenantsCache;
 }
 
 export function setActiveTenant(tenantId: string): void {
-  tenantsCache = null; // force refresh next time
   activeTenantId = tenantId;
 }
 
@@ -133,567 +200,411 @@ export function getActiveTenantId(): string | null {
   return activeTenantId;
 }
 
+async function resolveTenantId(explicit?: string): Promise<string> {
+  if (explicit) return explicit;
+  if (isOAuthMode()) {
+    throw new Error("tenantId is required in OAuth mode. Use xero_list_organisations to see available tenants.");
+  }
+  if (activeTenantId) return activeTenantId;
+  const tenants = await getTenants();
+  if (tenants.length === 0) throw new Error("No Xero organisations connected.");
+  activeTenantId = tenants[0].tenantId;
+  return activeTenantId;
+}
+
+async function getApiClient(tenantId?: string): Promise<AxiosInstance> {
+  const token = await getAccessToken();
+  const tid = await resolveTenantId(tenantId);
+  return axios.create({
+    baseURL: XERO_API_BASE,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "xero-tenant-id": tid,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+  });
+}
+
 // ─── Invoices ────────────────────────────────────────────────────────────────
-
-export async function listInvoices(params: {
-  status?: string;
-  contactId?: string;
-  dateFrom?: string;
-  dateTo?: string;
-  page?: number;
-}) {
-  const client = await getApiClient();
-  const query: Record<string, string | number> = { page: params.page ?? 1 };
-
+export async function listInvoices(p: { tenantId?: string; status?: string; contactId?: string; dateFrom?: string; dateTo?: string; page?: number; }) {
+  const client = await getApiClient(p.tenantId);
+  const query: Record<string, string | number> = { page: p.page ?? 1 };
   const where: string[] = ['Type=="ACCREC"'];
-  if (params.status) where.push(`Status=="${params.status}"`);
-  if (params.contactId)
-    where.push(`Contact.ContactID=Guid("${params.contactId}")`);
-  if (params.dateFrom) query["fromDate"] = params.dateFrom;
-  if (params.dateTo) query["toDate"] = params.dateTo;
+  if (p.status) where.push(`Status=="${p.status}"`);
+  if (p.contactId) where.push(`Contact.ContactID=Guid("${p.contactId}")`);
+  if (p.dateFrom) query["fromDate"] = p.dateFrom;
+  if (p.dateTo) query["toDate"] = p.dateTo;
   if (where.length) query["where"] = where.join("&&");
-
   const response = await client.get("/Invoices", { params: query });
   return response.data.Invoices ?? [];
 }
 
-export async function getInvoice(invoiceIdOrNumber: string) {
-  const client = await getApiClient();
+export async function getInvoice(invoiceIdOrNumber: string, tenantId?: string) {
+  const client = await getApiClient(tenantId);
   const response = await client.get(`/Invoices/${invoiceIdOrNumber}`);
   return response.data.Invoices?.[0] ?? null;
 }
 
-// ─── Bills (Accounts Payable) ────────────────────────────────────────────────
-
-export async function listBills(params: {
-  status?: string;
-  contactId?: string;
-  dateFrom?: string;
-  dateTo?: string;
-  page?: number;
-}) {
-  const client = await getApiClient();
-  const query: Record<string, string | number> = { page: params.page ?? 1 };
-
+// ─── Bills ───────────────────────────────────────────────────────────────────
+export async function listBills(p: { tenantId?: string; status?: string; contactId?: string; dateFrom?: string; dateTo?: string; page?: number; }) {
+  const client = await getApiClient(p.tenantId);
+  const query: Record<string, string | number> = { page: p.page ?? 1 };
   const where: string[] = ['Type=="ACCPAY"'];
-  if (params.status) where.push(`Status=="${params.status}"`);
-  if (params.contactId)
-    where.push(`Contact.ContactID=Guid("${params.contactId}")`);
-  if (params.dateFrom) query["fromDate"] = params.dateFrom;
-  if (params.dateTo) query["toDate"] = params.dateTo;
+  if (p.status) where.push(`Status=="${p.status}"`);
+  if (p.contactId) where.push(`Contact.ContactID=Guid("${p.contactId}")`);
+  if (p.dateFrom) query["fromDate"] = p.dateFrom;
+  if (p.dateTo) query["toDate"] = p.dateTo;
   if (where.length) query["where"] = where.join("&&");
-
   const response = await client.get("/Invoices", { params: query });
   return response.data.Invoices ?? [];
 }
 
 // ─── Payments ────────────────────────────────────────────────────────────────
-
-export async function listPayments(params: {
-  status?: string;
-  dateFrom?: string;
-  dateTo?: string;
-  page?: number;
-}) {
-  const client = await getApiClient();
-  const query: Record<string, string | number> = { page: params.page ?? 1 };
-
+export async function listPayments(p: { tenantId?: string; status?: string; dateFrom?: string; dateTo?: string; page?: number; }) {
+  const client = await getApiClient(p.tenantId);
+  const query: Record<string, string | number> = { page: p.page ?? 1 };
   const where: string[] = [];
-  if (params.status) where.push(`Status=="${params.status}"`);
+  if (p.status) where.push(`Status=="${p.status}"`);
   if (where.length) query["where"] = where.join("&&");
-  if (params.dateFrom) query["fromDate"] = params.dateFrom;
-  if (params.dateTo) query["toDate"] = params.dateTo;
-
+  if (p.dateFrom) query["fromDate"] = p.dateFrom;
+  if (p.dateTo) query["toDate"] = p.dateTo;
   const response = await client.get("/Payments", { params: query });
   return response.data.Payments ?? [];
 }
 
 // ─── Bank Transactions ───────────────────────────────────────────────────────
-
-export async function listBankTransactions(params: {
-  bankAccountId?: string;
-  status?: string;
-  dateFrom?: string;
-  dateTo?: string;
-  page?: number;
-}) {
-  const client = await getApiClient();
-  const query: Record<string, string | number> = { page: params.page ?? 1 };
-
+export async function listBankTransactions(p: { tenantId?: string; bankAccountId?: string; status?: string; dateFrom?: string; dateTo?: string; page?: number; }) {
+  const client = await getApiClient(p.tenantId);
+  const query: Record<string, string | number> = { page: p.page ?? 1 };
   const where: string[] = [];
-  if (params.bankAccountId)
-    where.push(`BankAccount.AccountID=Guid("${params.bankAccountId}")`);
-  if (params.status) where.push(`Status=="${params.status}"`);
+  if (p.bankAccountId) where.push(`BankAccount.AccountID=Guid("${p.bankAccountId}")`);
+  if (p.status) where.push(`Status=="${p.status}"`);
   if (where.length) query["where"] = where.join("&&");
-  if (params.dateFrom) query["fromDate"] = params.dateFrom;
-  if (params.dateTo) query["toDate"] = params.dateTo;
-
+  if (p.dateFrom) query["fromDate"] = p.dateFrom;
+  if (p.dateTo) query["toDate"] = p.dateTo;
   const response = await client.get("/BankTransactions", { params: query });
   return response.data.BankTransactions ?? [];
 }
 
-export async function listBankAccounts() {
-  const client = await getApiClient();
-  const response = await client.get("/Accounts", {
-    params: { where: 'Type=="BANK"' },
-  });
+export async function listBankAccounts(tenantId?: string) {
+  const client = await getApiClient(tenantId);
+  const response = await client.get("/Accounts", { params: { where: 'Type=="BANK"' } });
   return response.data.Accounts ?? [];
 }
 
 // ─── Chart of Accounts ───────────────────────────────────────────────────────
-
-export async function listAccounts(params: {
-  type?: string;
-  status?: string;
-}) {
-  const client = await getApiClient();
+export async function listAccounts(p: { tenantId?: string; type?: string; status?: string; }) {
+  const client = await getApiClient(p.tenantId);
   const where: string[] = [];
-  if (params.type) where.push(`Type=="${params.type}"`);
-  if (params.status) where.push(`Status=="${params.status}"`);
-
+  if (p.type) where.push(`Type=="${p.type}"`);
+  if (p.status) where.push(`Status=="${p.status}"`);
   const query: Record<string, string> = {};
   if (where.length) query["where"] = where.join("&&");
-
   const response = await client.get("/Accounts", { params: query });
   return response.data.Accounts ?? [];
 }
 
-// ─── Journal Entries ─────────────────────────────────────────────────────────
-
-export async function listJournals(params: {
-  offset?: number;
-  dateFrom?: string;
-  dateTo?: string;
-}) {
-  const client = await getApiClient();
+// ─── Journals ────────────────────────────────────────────────────────────────
+export async function listJournals(p: { tenantId?: string; offset?: number; dateFrom?: string; dateTo?: string; }) {
+  const client = await getApiClient(p.tenantId);
   const query: Record<string, string | number> = {};
-  if (params.offset !== undefined) query["offset"] = params.offset;
-  if (params.dateFrom) query["fromDate"] = params.dateFrom;
-  if (params.dateTo) query["toDate"] = params.dateTo;
-
+  if (p.offset !== undefined) query["offset"] = p.offset;
+  if (p.dateFrom) query["fromDate"] = p.dateFrom;
+  if (p.dateTo) query["toDate"] = p.dateTo;
   const response = await client.get("/Journals", { params: query });
   return response.data.Journals ?? [];
 }
 
 // ─── Reports ─────────────────────────────────────────────────────────────────
-
-export async function getProfitAndLoss(params: {
-  fromDate?: string;
-  toDate?: string;
-  periods?: number;
-  timeframe?: string;
-  trackingCategoryID?: string;
-}) {
-  const client = await getApiClient();
+export async function getProfitAndLoss(p: { tenantId?: string; fromDate?: string; toDate?: string; periods?: number; timeframe?: string; trackingCategoryID?: string; }) {
+  const client = await getApiClient(p.tenantId);
   const query: Record<string, string | number> = {};
-  if (params.fromDate) query["fromDate"] = params.fromDate;
-  if (params.toDate) query["toDate"] = params.toDate;
-  if (params.periods) query["periods"] = params.periods;
-  if (params.timeframe) query["timeframe"] = params.timeframe;
-  if (params.trackingCategoryID)
-    query["trackingCategoryID"] = params.trackingCategoryID;
-
-  const response = await client.get("/Reports/ProfitAndLoss", {
-    params: query,
-  });
+  if (p.fromDate) query["fromDate"] = p.fromDate;
+  if (p.toDate) query["toDate"] = p.toDate;
+  if (p.periods) query["periods"] = p.periods;
+  if (p.timeframe) query["timeframe"] = p.timeframe;
+  if (p.trackingCategoryID) query["trackingCategoryID"] = p.trackingCategoryID;
+  const response = await client.get("/Reports/ProfitAndLoss", { params: query });
   return response.data.Reports?.[0] ?? null;
 }
 
-export async function getBalanceSheet(params: {
-  date?: string;
-  periods?: number;
-  timeframe?: string;
-}) {
-  const client = await getApiClient();
+export async function getBalanceSheet(p: { tenantId?: string; date?: string; periods?: number; timeframe?: string; }) {
+  const client = await getApiClient(p.tenantId);
   const query: Record<string, string | number> = {};
-  if (params.date) query["date"] = params.date;
-  if (params.periods) query["periods"] = params.periods;
-  if (params.timeframe) query["timeframe"] = params.timeframe;
-
+  if (p.date) query["date"] = p.date;
+  if (p.periods) query["periods"] = p.periods;
+  if (p.timeframe) query["timeframe"] = p.timeframe;
   const response = await client.get("/Reports/BalanceSheet", { params: query });
   return response.data.Reports?.[0] ?? null;
 }
 
-export async function getCashFlow(params: {
-  fromDate?: string;
-  toDate?: string;
-}) {
-  const client = await getApiClient();
+export async function getCashFlow(p: { tenantId?: string; fromDate?: string; toDate?: string; }) {
+  const client = await getApiClient(p.tenantId);
   const query: Record<string, string> = {};
-  if (params.fromDate) query["fromDate"] = params.fromDate;
-  if (params.toDate) query["toDate"] = params.toDate;
-
+  if (p.fromDate) query["fromDate"] = p.fromDate;
+  if (p.toDate) query["toDate"] = p.toDate;
   const response = await client.get("/Reports/CashSummary", { params: query });
   return response.data.Reports?.[0] ?? null;
 }
 
 // ─── Contacts ────────────────────────────────────────────────────────────────
-
-export async function listContacts(params: {
-  name?: string;
-  isSupplier?: boolean;
-  isCustomer?: boolean;
-  page?: number;
-}) {
-  const client = await getApiClient();
-  const query: Record<string, string | number> = { page: params.page ?? 1 };
-
+export async function listContacts(p: { tenantId?: string; name?: string; isSupplier?: boolean; isCustomer?: boolean; page?: number; }) {
+  const client = await getApiClient(p.tenantId);
+  const query: Record<string, string | number> = { page: p.page ?? 1 };
   const where: string[] = [];
-  if (params.isSupplier !== undefined)
-    where.push(`IsSupplier==${params.isSupplier}`);
-  if (params.isCustomer !== undefined)
-    where.push(`IsCustomer==${params.isCustomer}`);
+  if (p.isSupplier !== undefined) where.push(`IsSupplier==${p.isSupplier}`);
+  if (p.isCustomer !== undefined) where.push(`IsCustomer==${p.isCustomer}`);
   if (where.length) query["where"] = where.join("&&");
-  if (params.name) query["searchTerm"] = params.name;
-
+  if (p.name) query["searchTerm"] = p.name;
   const response = await client.get("/Contacts", { params: query });
   return response.data.Contacts ?? [];
 }
 
-export async function getContact(contactIdOrName: string) {
-  const client = await getApiClient();
+export async function getContact(contactIdOrName: string, tenantId?: string) {
+  const client = await getApiClient(tenantId);
   const response = await client.get(`/Contacts/${contactIdOrName}`);
   return response.data.Contacts?.[0] ?? null;
 }
 
-// ─── Credit Notes ─────────────────────────────────────────────────────────────
-
-export async function listCreditNotes(params: {
-  status?: string;
-  contactId?: string;
-  dateFrom?: string;
-  dateTo?: string;
-  page?: number;
-}) {
-  const client = await getApiClient();
-  const query: Record<string, string | number> = { page: params.page ?? 1 };
+// ─── Credit Notes ────────────────────────────────────────────────────────────
+export async function listCreditNotes(p: { tenantId?: string; status?: string; contactId?: string; dateFrom?: string; dateTo?: string; page?: number; }) {
+  const client = await getApiClient(p.tenantId);
+  const query: Record<string, string | number> = { page: p.page ?? 1 };
   const where: string[] = [];
-  if (params.status) where.push(`Status=="${params.status}"`);
-  if (params.contactId) where.push(`Contact.ContactID=Guid("${params.contactId}")`);
+  if (p.status) where.push(`Status=="${p.status}"`);
+  if (p.contactId) where.push(`Contact.ContactID=Guid("${p.contactId}")`);
   if (where.length) query["where"] = where.join("&&");
-  if (params.dateFrom) query["fromDate"] = params.dateFrom;
-  if (params.dateTo) query["toDate"] = params.dateTo;
+  if (p.dateFrom) query["fromDate"] = p.dateFrom;
+  if (p.dateTo) query["toDate"] = p.dateTo;
   const response = await client.get("/CreditNotes", { params: query });
   return response.data.CreditNotes ?? [];
 }
 
-export async function getCreditNote(creditNoteIdOrNumber: string) {
-  const client = await getApiClient();
+export async function getCreditNote(creditNoteIdOrNumber: string, tenantId?: string) {
+  const client = await getApiClient(tenantId);
   const response = await client.get(`/CreditNotes/${creditNoteIdOrNumber}`);
   return response.data.CreditNotes?.[0] ?? null;
 }
 
-// ─── Quotes ───────────────────────────────────────────────────────────────────
-
-export async function listQuotes(params: {
-  status?: string;
-  contactId?: string;
-  dateFrom?: string;
-  dateTo?: string;
-  page?: number;
-}) {
-  const client = await getApiClient();
-  const query: Record<string, string | number> = { page: params.page ?? 1 };
-  if (params.status) query["status"] = params.status;
-  if (params.contactId) query["ContactID"] = params.contactId;
-  if (params.dateFrom) query["DateFrom"] = params.dateFrom;
-  if (params.dateTo) query["DateTo"] = params.dateTo;
+// ─── Quotes ──────────────────────────────────────────────────────────────────
+export async function listQuotes(p: { tenantId?: string; status?: string; contactId?: string; dateFrom?: string; dateTo?: string; page?: number; }) {
+  const client = await getApiClient(p.tenantId);
+  const query: Record<string, string | number> = { page: p.page ?? 1 };
+  if (p.status) query["status"] = p.status;
+  if (p.contactId) query["ContactID"] = p.contactId;
+  if (p.dateFrom) query["DateFrom"] = p.dateFrom;
+  if (p.dateTo) query["DateTo"] = p.dateTo;
   const response = await client.get("/Quotes", { params: query });
   return response.data.Quotes ?? [];
 }
 
-export async function getQuote(quoteIdOrNumber: string) {
-  const client = await getApiClient();
+export async function getQuote(quoteIdOrNumber: string, tenantId?: string) {
+  const client = await getApiClient(tenantId);
   const response = await client.get(`/Quotes/${quoteIdOrNumber}`);
   return response.data.Quotes?.[0] ?? null;
 }
 
-// ─── Purchase Orders ──────────────────────────────────────────────────────────
-
-export async function listPurchaseOrders(params: {
-  status?: string;
-  dateFrom?: string;
-  dateTo?: string;
-  page?: number;
-}) {
-  const client = await getApiClient();
-  const query: Record<string, string | number> = { page: params.page ?? 1 };
-  if (params.status) query["status"] = params.status;
-  if (params.dateFrom) query["DateFrom"] = params.dateFrom;
-  if (params.dateTo) query["DateTo"] = params.dateTo;
+// ─── Purchase Orders ─────────────────────────────────────────────────────────
+export async function listPurchaseOrders(p: { tenantId?: string; status?: string; dateFrom?: string; dateTo?: string; page?: number; }) {
+  const client = await getApiClient(p.tenantId);
+  const query: Record<string, string | number> = { page: p.page ?? 1 };
+  if (p.status) query["status"] = p.status;
+  if (p.dateFrom) query["DateFrom"] = p.dateFrom;
+  if (p.dateTo) query["DateTo"] = p.dateTo;
   const response = await client.get("/PurchaseOrders", { params: query });
   return response.data.PurchaseOrders ?? [];
 }
 
-export async function getPurchaseOrder(purchaseOrderIdOrNumber: string) {
-  const client = await getApiClient();
+export async function getPurchaseOrder(purchaseOrderIdOrNumber: string, tenantId?: string) {
+  const client = await getApiClient(tenantId);
   const response = await client.get(`/PurchaseOrders/${purchaseOrderIdOrNumber}`);
   return response.data.PurchaseOrders?.[0] ?? null;
 }
 
-// ─── Items (Products & Services) ─────────────────────────────────────────────
-
-export async function listItems(params: { searchTerm?: string }) {
-  const client = await getApiClient();
+// ─── Items ───────────────────────────────────────────────────────────────────
+export async function listItems(p: { tenantId?: string; searchTerm?: string }) {
+  const client = await getApiClient(p.tenantId);
   const query: Record<string, string> = {};
-  if (params.searchTerm) query["searchTerm"] = params.searchTerm;
+  if (p.searchTerm) query["searchTerm"] = p.searchTerm;
   const response = await client.get("/Items", { params: query });
   return response.data.Items ?? [];
 }
 
-export async function getItem(itemIdOrCode: string) {
-  const client = await getApiClient();
+export async function getItem(itemIdOrCode: string, tenantId?: string) {
+  const client = await getApiClient(tenantId);
   const response = await client.get(`/Items/${itemIdOrCode}`);
   return response.data.Items?.[0] ?? null;
 }
 
-// ─── Tracking Categories ──────────────────────────────────────────────────────
-
-export async function listTrackingCategories() {
-  const client = await getApiClient();
-  const response = await client.get("/TrackingCategories", {
-    params: { includeArchived: false },
-  });
+// ─── Tracking Categories ─────────────────────────────────────────────────────
+export async function listTrackingCategories(tenantId?: string) {
+  const client = await getApiClient(tenantId);
+  const response = await client.get("/TrackingCategories", { params: { includeArchived: false } });
   return response.data.TrackingCategories ?? [];
 }
 
-// ─── Tax Rates ────────────────────────────────────────────────────────────────
-
-export async function listTaxRates(params: { taxType?: string }) {
-  const client = await getApiClient();
+// ─── Tax Rates ───────────────────────────────────────────────────────────────
+export async function listTaxRates(p: { tenantId?: string; taxType?: string }) {
+  const client = await getApiClient(p.tenantId);
   const query: Record<string, string> = {};
-  if (params.taxType) query["where"] = `TaxType=="${params.taxType}"`;
+  if (p.taxType) query["where"] = `TaxType=="${p.taxType}"`;
   const response = await client.get("/TaxRates", { params: query });
   return response.data.TaxRates ?? [];
 }
 
-// ─── Manual Journals ──────────────────────────────────────────────────────────
-
-export async function listManualJournals(params: {
-  status?: string;
-  dateFrom?: string;
-  dateTo?: string;
-  page?: number;
-}) {
-  const client = await getApiClient();
-  const query: Record<string, string | number> = { page: params.page ?? 1 };
+// ─── Manual Journals ─────────────────────────────────────────────────────────
+export async function listManualJournals(p: { tenantId?: string; status?: string; dateFrom?: string; dateTo?: string; page?: number; }) {
+  const client = await getApiClient(p.tenantId);
+  const query: Record<string, string | number> = { page: p.page ?? 1 };
   const where: string[] = [];
-  if (params.status) where.push(`Status=="${params.status}"`);
+  if (p.status) where.push(`Status=="${p.status}"`);
   if (where.length) query["where"] = where.join("&&");
-  if (params.dateFrom) query["fromDate"] = params.dateFrom;
-  if (params.dateTo) query["toDate"] = params.dateTo;
+  if (p.dateFrom) query["fromDate"] = p.dateFrom;
+  if (p.dateTo) query["toDate"] = p.dateTo;
   const response = await client.get("/ManualJournals", { params: query });
   return response.data.ManualJournals ?? [];
 }
 
-// ─── Repeating Invoices ───────────────────────────────────────────────────────
-
-export async function listRepeatingInvoices(params: { status?: string }) {
-  const client = await getApiClient();
+// ─── Repeating Invoices ──────────────────────────────────────────────────────
+export async function listRepeatingInvoices(p: { tenantId?: string; status?: string }) {
+  const client = await getApiClient(p.tenantId);
   const query: Record<string, string> = {};
-  if (params.status) query["where"] = `Status=="${params.status}"`;
+  if (p.status) query["where"] = `Status=="${p.status}"`;
   const response = await client.get("/RepeatingInvoices", { params: query });
   return response.data.RepeatingInvoices ?? [];
 }
 
-// ─── Overpayments & Prepayments ───────────────────────────────────────────────
-
-export async function listOverpayments(params: {
-  contactId?: string;
-  dateFrom?: string;
-  dateTo?: string;
-  page?: number;
-}) {
-  const client = await getApiClient();
-  const query: Record<string, string | number> = { page: params.page ?? 1 };
+// ─── Overpayments & Prepayments ──────────────────────────────────────────────
+export async function listOverpayments(p: { tenantId?: string; contactId?: string; dateFrom?: string; dateTo?: string; page?: number; }) {
+  const client = await getApiClient(p.tenantId);
+  const query: Record<string, string | number> = { page: p.page ?? 1 };
   const where: string[] = [];
-  if (params.contactId) where.push(`Contact.ContactID=Guid("${params.contactId}")`);
+  if (p.contactId) where.push(`Contact.ContactID=Guid("${p.contactId}")`);
   if (where.length) query["where"] = where.join("&&");
-  if (params.dateFrom) query["fromDate"] = params.dateFrom;
-  if (params.dateTo) query["toDate"] = params.dateTo;
+  if (p.dateFrom) query["fromDate"] = p.dateFrom;
+  if (p.dateTo) query["toDate"] = p.dateTo;
   const response = await client.get("/Overpayments", { params: query });
   return response.data.Overpayments ?? [];
 }
 
-export async function listPrepayments(params: {
-  contactId?: string;
-  dateFrom?: string;
-  dateTo?: string;
-  page?: number;
-}) {
-  const client = await getApiClient();
-  const query: Record<string, string | number> = { page: params.page ?? 1 };
+export async function listPrepayments(p: { tenantId?: string; contactId?: string; dateFrom?: string; dateTo?: string; page?: number; }) {
+  const client = await getApiClient(p.tenantId);
+  const query: Record<string, string | number> = { page: p.page ?? 1 };
   const where: string[] = [];
-  if (params.contactId) where.push(`Contact.ContactID=Guid("${params.contactId}")`);
+  if (p.contactId) where.push(`Contact.ContactID=Guid("${p.contactId}")`);
   if (where.length) query["where"] = where.join("&&");
-  if (params.dateFrom) query["fromDate"] = params.dateFrom;
-  if (params.dateTo) query["toDate"] = params.dateTo;
+  if (p.dateFrom) query["fromDate"] = p.dateFrom;
+  if (p.dateTo) query["toDate"] = p.dateTo;
   const response = await client.get("/Prepayments", { params: query });
   return response.data.Prepayments ?? [];
 }
 
-// ─── Extended Reports ─────────────────────────────────────────────────────────
-
-export async function getAgedReceivables(params: {
-  contactId?: string;
-  date?: string;
-  fromDate?: string;
-  toDate?: string;
-}) {
-  const client = await getApiClient();
+// ─── Extended Reports ────────────────────────────────────────────────────────
+export async function getAgedReceivables(p: { tenantId?: string; contactId?: string; date?: string; fromDate?: string; toDate?: string; }) {
+  const client = await getApiClient(p.tenantId);
   const query: Record<string, string> = {};
-  if (params.contactId) query["contactID"] = params.contactId;
-  if (params.date) query["date"] = params.date;
-  if (params.fromDate) query["fromDate"] = params.fromDate;
-  if (params.toDate) query["toDate"] = params.toDate;
+  if (p.contactId) query["contactID"] = p.contactId;
+  if (p.date) query["date"] = p.date;
+  if (p.fromDate) query["fromDate"] = p.fromDate;
+  if (p.toDate) query["toDate"] = p.toDate;
   const response = await client.get("/Reports/AgedReceivablesByContact", { params: query });
   return response.data.Reports?.[0] ?? null;
 }
 
-export async function getAgedPayables(params: {
-  contactId?: string;
-  date?: string;
-  fromDate?: string;
-  toDate?: string;
-}) {
-  const client = await getApiClient();
+export async function getAgedPayables(p: { tenantId?: string; contactId?: string; date?: string; fromDate?: string; toDate?: string; }) {
+  const client = await getApiClient(p.tenantId);
   const query: Record<string, string> = {};
-  if (params.contactId) query["contactID"] = params.contactId;
-  if (params.date) query["date"] = params.date;
-  if (params.fromDate) query["fromDate"] = params.fromDate;
-  if (params.toDate) query["toDate"] = params.toDate;
+  if (p.contactId) query["contactID"] = p.contactId;
+  if (p.date) query["date"] = p.date;
+  if (p.fromDate) query["fromDate"] = p.fromDate;
+  if (p.toDate) query["toDate"] = p.toDate;
   const response = await client.get("/Reports/AgedPayablesByContact", { params: query });
   return response.data.Reports?.[0] ?? null;
 }
 
-export async function getTrialBalance(params: {
-  date?: string;
-  paymentsOnly?: boolean;
-}) {
-  const client = await getApiClient();
+export async function getTrialBalance(p: { tenantId?: string; date?: string; paymentsOnly?: boolean }) {
+  const client = await getApiClient(p.tenantId);
   const query: Record<string, string | boolean> = {};
-  if (params.date) query["date"] = params.date;
-  if (params.paymentsOnly !== undefined) query["paymentsOnly"] = params.paymentsOnly;
+  if (p.date) query["date"] = p.date;
+  if (p.paymentsOnly !== undefined) query["paymentsOnly"] = p.paymentsOnly;
   const response = await client.get("/Reports/TrialBalance", { params: query });
   return response.data.Reports?.[0] ?? null;
 }
 
-export async function getExecutiveSummary(params: { date?: string }) {
-  const client = await getApiClient();
+export async function getExecutiveSummary(p: { tenantId?: string; date?: string }) {
+  const client = await getApiClient(p.tenantId);
   const query: Record<string, string> = {};
-  if (params.date) query["date"] = params.date;
+  if (p.date) query["date"] = p.date;
   const response = await client.get("/Reports/ExecutiveSummary", { params: query });
   return response.data.Reports?.[0] ?? null;
 }
 
-export async function getBankSummary(params: {
-  fromDate?: string;
-  toDate?: string;
-}) {
-  const client = await getApiClient();
+export async function getBankSummary(p: { tenantId?: string; fromDate?: string; toDate?: string }) {
+  const client = await getApiClient(p.tenantId);
   const query: Record<string, string> = {};
-  if (params.fromDate) query["fromDate"] = params.fromDate;
-  if (params.toDate) query["toDate"] = params.toDate;
+  if (p.fromDate) query["fromDate"] = p.fromDate;
+  if (p.toDate) query["toDate"] = p.toDate;
   const response = await client.get("/Reports/BankSummary", { params: query });
   return response.data.Reports?.[0] ?? null;
 }
 
-export async function getBudgetSummary(params: {
-  date?: string;
-  periods?: number;
-  timeframe?: number;
-}) {
-  const client = await getApiClient();
+export async function getBudgetSummary(p: { tenantId?: string; date?: string; periods?: number; timeframe?: number }) {
+  const client = await getApiClient(p.tenantId);
   const query: Record<string, string | number> = {};
-  if (params.date) query["date"] = params.date;
-  if (params.periods) query["periods"] = params.periods;
-  if (params.timeframe) query["timeframe"] = params.timeframe;
+  if (p.date) query["date"] = p.date;
+  if (p.periods) query["periods"] = p.periods;
+  if (p.timeframe) query["timeframe"] = p.timeframe;
   const response = await client.get("/Reports/BudgetSummary", { params: query });
   return response.data.Reports?.[0] ?? null;
 }
 
-export async function getGSTReport(params: {
-  fromDate?: string;
-  toDate?: string;
-}) {
-  const client = await getApiClient();
+export async function getGSTReport(p: { tenantId?: string; fromDate?: string; toDate?: string }) {
+  const client = await getApiClient(p.tenantId);
   const query: Record<string, string> = {};
-  if (params.fromDate) query["fromDate"] = params.fromDate;
-  if (params.toDate) query["toDate"] = params.toDate;
-  // GST report endpoint — returns BAS/VAT summary
+  if (p.fromDate) query["fromDate"] = p.fromDate;
+  if (p.toDate) query["toDate"] = p.toDate;
   const response = await client.get("/Reports/GST", { params: query });
   return response.data.Reports?.[0] ?? null;
 }
 
-// ─── Fixed Assets ─────────────────────────────────────────────────────────────
-// Assets API uses a different base URL
-
-export async function listAssets(params: {
-  status?: string;
-  page?: number;
-  pageSize?: number;
-}) {
+// ─── Fixed Assets ────────────────────────────────────────────────────────────
+export async function listAssets(p: { tenantId?: string; status?: string; page?: number; pageSize?: number }) {
   const token = await getAccessToken();
-  // Ensure tenant is loaded
-  if (!activeTenantId) {
-    const tenants = await getTenants();
-    if (tenants.length === 0) throw new Error("No Xero organisations connected");
-    activeTenantId = tenants[0].tenantId;
-  }
-  const query: Record<string, string | number> = {
-    page: params.page ?? 1,
-    pageSize: params.pageSize ?? 100,
-  };
-  if (params.status) query["status"] = params.status;
-
+  const tid = await resolveTenantId(p.tenantId);
+  const query: Record<string, string | number> = { page: p.page ?? 1, pageSize: p.pageSize ?? 100 };
+  if (p.status) query["status"] = p.status;
   const response = await axios.get("https://api.xero.com/assets.xro/1.0/Assets", {
     params: query,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "xero-tenant-id": activeTenantId,
-      Accept: "application/json",
-    },
+    headers: { Authorization: `Bearer ${token}`, "xero-tenant-id": tid, Accept: "application/json" },
   });
   return response.data.items ?? response.data ?? [];
 }
 
-export async function getAssetSettings() {
+export async function getAssetSettings(tenantId?: string) {
   const token = await getAccessToken();
-  if (!activeTenantId) {
-    const tenants = await getTenants();
-    if (tenants.length === 0) throw new Error("No Xero organisations connected");
-    activeTenantId = tenants[0].tenantId;
-  }
+  const tid = await resolveTenantId(tenantId);
   const response = await axios.get("https://api.xero.com/assets.xro/1.0/Settings", {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "xero-tenant-id": activeTenantId,
-      Accept: "application/json",
-    },
+    headers: { Authorization: `Bearer ${token}`, "xero-tenant-id": tid, Accept: "application/json" },
   });
   return response.data;
 }
 
-// ─── Contact Groups ───────────────────────────────────────────────────────────
-
-export async function listContactGroups() {
-  const client = await getApiClient();
+// ─── Misc ────────────────────────────────────────────────────────────────────
+export async function listContactGroups(tenantId?: string) {
+  const client = await getApiClient(tenantId);
   const response = await client.get("/ContactGroups");
   return response.data.ContactGroups ?? [];
 }
 
-// ─── Currencies ───────────────────────────────────────────────────────────────
-
-export async function listCurrencies() {
-  const client = await getApiClient();
+export async function listCurrencies(tenantId?: string) {
+  const client = await getApiClient(tenantId);
   const response = await client.get("/Currencies");
   return response.data.Currencies ?? [];
 }
 
-// ─── Organisation Details ─────────────────────────────────────────────────────
-
-export async function getOrganisationDetails() {
-  const client = await getApiClient();
+export async function getOrganisationDetails(tenantId?: string) {
+  const client = await getApiClient(tenantId);
   const response = await client.get("/Organisation");
   return response.data.Organisations?.[0] ?? null;
 }
