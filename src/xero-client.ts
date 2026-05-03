@@ -274,17 +274,129 @@ export async function listPayments(p: { tenantId?: string; status?: string; date
 }
 
 // ─── Bank Transactions ───────────────────────────────────────────────────────
-export async function listBankTransactions(p: { tenantId?: string; bankAccountId?: string; status?: string; dateFrom?: string; dateTo?: string; page?: number; }) {
+// Supports two filtering modes:
+//   - unreconciledOnly: when true, server fetches ALL pages, filters in-memory
+//     to entries where IsReconciled === false, and returns just those.
+//   - summary: when true, returns { count, totalAmount, oldestDate, newestDate,
+//     bankAccounts: [{ name, count, totalAmount }] } instead of full transaction
+//     objects. Massively cheaper in tokens for sweeping many clients.
+// Both modes can be combined ("unreconciled summary across all clients").
+const BANK_TXN_PAGE_SIZE = 100;
+const MAX_PAGES_SAFETY = 50; // 5,000 txns per call max — guard against runaway
+
+interface BankTxnSummary {
+  count: number;
+  totalAmount: number;
+  oldestDate: string | null;
+  newestDate: string | null;
+  bankAccounts: Array<{ accountId: string; name: string; count: number; totalAmount: number }>;
+}
+
+export async function listBankTransactions(p: {
+  tenantId?: string;
+  bankAccountId?: string;
+  status?: string;
+  dateFrom?: string;
+  dateTo?: string;
+  page?: number;
+  unreconciledOnly?: boolean;
+  summary?: boolean;
+}) {
   const client = await getApiClient(p.tenantId);
-  const query: Record<string, string | number> = { page: p.page ?? 1 };
   const where: string[] = [];
   if (p.bankAccountId) where.push(`BankAccount.AccountID=Guid("${p.bankAccountId}")`);
   if (p.status) where.push(`Status=="${p.status}"`);
-  if (where.length) query["where"] = where.join("&&");
-  if (p.dateFrom) query["fromDate"] = p.dateFrom;
-  if (p.dateTo) query["toDate"] = p.dateTo;
-  const response = await client.get("/BankTransactions", { params: query });
-  return response.data.BankTransactions ?? [];
+  // Server-side filter for IsReconciled when supported. Xero's where syntax does
+  // accept IsReconciled comparisons, so we push it down for efficiency.
+  if (p.unreconciledOnly) where.push("IsReconciled==false");
+
+  const baseParams: Record<string, string | number> = {};
+  if (where.length) baseParams["where"] = where.join("&&");
+  if (p.dateFrom) baseParams["fromDate"] = p.dateFrom;
+  if (p.dateTo) baseParams["toDate"] = p.dateTo;
+
+  // Paginated fetch helper — returns concatenated transactions across pages.
+  // Only used when unreconciledOnly or summary is true (we want the full set
+  // to filter or aggregate). Otherwise we honour the caller's page param.
+  const fetchAll = async (): Promise<unknown[]> => {
+    const all: unknown[] = [];
+    for (let page = 1; page <= MAX_PAGES_SAFETY; page++) {
+      const response = await client.get("/BankTransactions", {
+        params: { ...baseParams, page },
+      });
+      const batch: unknown[] = response.data.BankTransactions ?? [];
+      all.push(...batch);
+      if (batch.length < BANK_TXN_PAGE_SIZE) break;
+    }
+    return all;
+  };
+
+  // Fast path: no aggregation requested → single page like before.
+  if (!p.unreconciledOnly && !p.summary) {
+    const response = await client.get("/BankTransactions", {
+      params: { ...baseParams, page: p.page ?? 1 },
+    });
+    return response.data.BankTransactions ?? [];
+  }
+
+  // Aggregating path: fetch all matching pages.
+  const txns = (await fetchAll()) as Array<{
+    BankTransactionID?: string;
+    Date?: string;
+    Total?: number;
+    IsReconciled?: boolean;
+    BankAccount?: { AccountID?: string; Name?: string };
+  }>;
+
+  // Belt-and-braces: even though we pushed IsReconciled==false to Xero, filter
+  // again client-side in case Xero ignored the predicate for any reason.
+  const filtered = p.unreconciledOnly
+    ? txns.filter((t) => t.IsReconciled === false)
+    : txns;
+
+  if (!p.summary) return filtered;
+
+  // Build summary
+  const summary: BankTxnSummary = {
+    count: filtered.length,
+    totalAmount: 0,
+    oldestDate: null,
+    newestDate: null,
+    bankAccounts: [],
+  };
+  const byAccount = new Map<string, { accountId: string; name: string; count: number; totalAmount: number }>();
+  for (const t of filtered) {
+    const amount = typeof t.Total === "number" ? t.Total : 0;
+    summary.totalAmount += amount;
+    // Xero dates come as "/Date(1234567890000+0000)/" — extract ms then ISO date
+    const d = parseXeroDate(t.Date);
+    if (d) {
+      if (!summary.oldestDate || d < summary.oldestDate) summary.oldestDate = d;
+      if (!summary.newestDate || d > summary.newestDate) summary.newestDate = d;
+    }
+    const accId = t.BankAccount?.AccountID ?? "unknown";
+    const accName = t.BankAccount?.Name ?? "Unknown";
+    const cur = byAccount.get(accId) ?? { accountId: accId, name: accName, count: 0, totalAmount: 0 };
+    cur.count += 1;
+    cur.totalAmount += amount;
+    byAccount.set(accId, cur);
+  }
+  summary.bankAccounts = Array.from(byAccount.values()).sort((a, b) => b.count - a.count);
+  // Round totals to 2dp for cleaner output
+  summary.totalAmount = Math.round(summary.totalAmount * 100) / 100;
+  for (const a of summary.bankAccounts) {
+    a.totalAmount = Math.round(a.totalAmount * 100) / 100;
+  }
+  return summary;
+}
+
+function parseXeroDate(raw: string | undefined): string | null {
+  if (!raw) return null;
+  const match = raw.match(/\/Date\((\d+)/);
+  if (!match) return null;
+  const ms = parseInt(match[1], 10);
+  if (isNaN(ms)) return null;
+  return new Date(ms).toISOString().slice(0, 10);
 }
 
 export async function listBankAccounts(tenantId?: string) {

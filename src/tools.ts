@@ -111,14 +111,21 @@ export const tools: ToolDefinition[] = [
   // ── Bank Transactions ────────────────────────────────────────────────────
   {
     name: "xero_list_bank_transactions",
-    description: "List bank transactions (spend money / receive money) from Xero. Filter by bank account, status, date range.",
+    description:
+      "List bank transactions (spend money / receive money) from Xero. " +
+      "Two cost-saving modes: " +
+      "(a) unreconciledOnly=true → server fetches all pages, returns ONLY unreconciled entries (IsReconciled==false). Useful for surfacing data-quality issues. " +
+      "(b) summary=true → returns aggregate {count, totalAmount, oldestDate, newestDate, bankAccounts[]} instead of full transaction details. Combine with unreconciledOnly for a cheap 'how many unreconciled per client' sweep across many tenants. " +
+      "When neither mode is set, behaves like a normal paginated list.",
     inputSchema: z.object({
       tenantId: tenantIdField,
       bankAccountId: z.string().optional().describe("Filter by bank Account GUID"),
       status: z.enum(["AUTHORISED", "DELETED"]).optional(),
       dateFrom: z.string().optional(),
       dateTo: z.string().optional(),
-      page: z.number().int().min(1).default(1),
+      page: z.number().int().min(1).default(1).describe("Page number (100 per page). Ignored when unreconciledOnly or summary is true (server fetches all pages)."),
+      unreconciledOnly: z.boolean().optional().describe("If true, return only entries with IsReconciled==false. Server auto-paginates."),
+      summary: z.boolean().optional().describe("If true, return aggregate counts/totals per bank account instead of full transactions. Massively cheaper in tokens. Server auto-paginates."),
     }),
     handler: async (input) => xero.listBankTransactions(input as Parameters<typeof xero.listBankTransactions>[0]),
   },
