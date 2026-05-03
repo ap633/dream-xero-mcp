@@ -301,16 +301,127 @@ export async function listBills(p: { tenantId?: string; status?: string; contact
 }
 
 // ─── Payments ────────────────────────────────────────────────────────────────
-export async function listPayments(p: { tenantId?: string; status?: string; dateFrom?: string; dateTo?: string; page?: number; }) {
+// Same unreconciledOnly + summary support as listBankTransactions.
+// Critical accounting use case: payments applied to AR invoices or AP bills
+// that look like normal cash events but were never matched to a real bank
+// statement line. These are the "phantom paid" entries that misrepresent
+// outstanding balances.
+//
+// Summary mode groups by PaymentType so you can see AR vs AP at a glance:
+//   ACCRECPAYMENT  = payment received against a sales invoice
+//   ACCPAYPAYMENT  = payment made against a supplier bill
+//   ARCREDITPAYMENT / APCREDITPAYMENT = credit note refunds
+//   AROVERPAYMENT  / APOVERPAYMENT  = overpayment refunds
+//   ARPREPAYMENT   / APPREPAYMENT   = prepayments
+
+const PAYMENTS_PAGE_SIZE = 100;
+const PAYMENTS_MAX_PAGES_SAFETY = 50;
+
+interface PaymentSummary {
+  count: number;
+  totalAmount: number;
+  oldestDate: string | null;
+  newestDate: string | null;
+  byPaymentType: Array<{ paymentType: string; count: number; totalAmount: number }>;
+  bankAccounts: Array<{ accountId: string; name: string; count: number; totalAmount: number }>;
+}
+
+export async function listPayments(p: {
+  tenantId?: string;
+  status?: string;
+  dateFrom?: string;
+  dateTo?: string;
+  page?: number;
+  unreconciledOnly?: boolean;
+  summary?: boolean;
+}) {
   const client = await getApiClient(p.tenantId);
-  const query: Record<string, string | number> = { page: p.page ?? 1 };
   const where: string[] = [];
   if (p.status) where.push(`Status=="${p.status}"`);
-  if (where.length) query["where"] = where.join("&&");
-  if (p.dateFrom) query["fromDate"] = p.dateFrom;
-  if (p.dateTo) query["toDate"] = p.dateTo;
-  const response = await client.get("/Payments", { params: query });
-  return response.data.Payments ?? [];
+  if (p.unreconciledOnly) {
+    where.push("IsReconciled==false");
+    where.push('Status!="DELETED"');
+  }
+  if (p.dateFrom) where.push(`Date >= DateTime(${formatDateForWhere(p.dateFrom)})`);
+  if (p.dateTo)   where.push(`Date <= DateTime(${formatDateForWhere(p.dateTo)})`);
+
+  const baseParams: Record<string, string | number> = {};
+  if (where.length) baseParams["where"] = where.join("&&");
+
+  const fetchAll = async (): Promise<unknown[]> => {
+    const all: unknown[] = [];
+    for (let page = 1; page <= PAYMENTS_MAX_PAGES_SAFETY; page++) {
+      const response = await client.get("/Payments", {
+        params: { ...baseParams, page },
+      });
+      const batch: unknown[] = response.data.Payments ?? [];
+      all.push(...batch);
+      if (batch.length < PAYMENTS_PAGE_SIZE) break;
+    }
+    return all;
+  };
+
+  if (!p.unreconciledOnly && !p.summary) {
+    const response = await client.get("/Payments", {
+      params: { ...baseParams, page: p.page ?? 1 },
+    });
+    return response.data.Payments ?? [];
+  }
+
+  const payments = (await fetchAll()) as Array<{
+    PaymentID?: string;
+    Date?: string;
+    Amount?: number;
+    IsReconciled?: boolean;
+    Status?: string;
+    PaymentType?: string;
+    Account?: { AccountID?: string; Name?: string; Code?: string };
+  }>;
+
+  const filtered = p.unreconciledOnly
+    ? payments.filter((t) => t.IsReconciled === false && t.Status !== "DELETED")
+    : payments;
+
+  if (!p.summary) return filtered;
+
+  const summary: PaymentSummary = {
+    count: filtered.length,
+    totalAmount: 0,
+    oldestDate: null,
+    newestDate: null,
+    byPaymentType: [],
+    bankAccounts: [],
+  };
+  const byType = new Map<string, { paymentType: string; count: number; totalAmount: number }>();
+  const byAccount = new Map<string, { accountId: string; name: string; count: number; totalAmount: number }>();
+
+  for (const t of filtered) {
+    const amount = typeof t.Amount === "number" ? t.Amount : 0;
+    summary.totalAmount += amount;
+    const d = parseXeroDate(t.Date);
+    if (d) {
+      if (!summary.oldestDate || d < summary.oldestDate) summary.oldestDate = d;
+      if (!summary.newestDate || d > summary.newestDate) summary.newestDate = d;
+    }
+    const pt = t.PaymentType ?? "UNKNOWN";
+    const ptCur = byType.get(pt) ?? { paymentType: pt, count: 0, totalAmount: 0 };
+    ptCur.count += 1;
+    ptCur.totalAmount += amount;
+    byType.set(pt, ptCur);
+    const accId = t.Account?.AccountID ?? "unknown";
+    const accName = t.Account?.Name ?? "Unknown";
+    const acCur = byAccount.get(accId) ?? { accountId: accId, name: accName, count: 0, totalAmount: 0 };
+    acCur.count += 1;
+    acCur.totalAmount += amount;
+    byAccount.set(accId, acCur);
+  }
+
+  summary.byPaymentType = Array.from(byType.values()).sort((a, b) => b.count - a.count);
+  summary.bankAccounts = Array.from(byAccount.values()).sort((a, b) => b.count - a.count);
+  summary.totalAmount = Math.round(summary.totalAmount * 100) / 100;
+  for (const x of summary.byPaymentType) x.totalAmount = Math.round(x.totalAmount * 100) / 100;
+  for (const x of summary.bankAccounts) x.totalAmount = Math.round(x.totalAmount * 100) / 100;
+  return summary;
 }
 
 // ─── Bank Transactions ───────────────────────────────────────────────────────
@@ -348,7 +459,12 @@ export async function listBankTransactions(p: {
   if (p.status) where.push(`Status=="${p.status}"`);
   // Server-side filter for IsReconciled when supported. Xero's where syntax does
   // accept IsReconciled comparisons, so we push it down for efficiency.
-  if (p.unreconciledOnly) where.push("IsReconciled==false");
+  if (p.unreconciledOnly) {
+    where.push("IsReconciled==false");
+    // Voided/deleted bank txns can never reconcile by definition. Excluding
+    // them prevents false positives in "find data quality issues" workflows.
+    where.push('Status!="DELETED"');
+  }
 
   // Xero's /BankTransactions endpoint applies fromDate/toDate query params to
   // UpdatedDateUTC, NOT to the transaction's posting Date. To filter by the

@@ -97,13 +97,20 @@ export const tools: ToolDefinition[] = [
   // ── Payments ─────────────────────────────────────────────────────────────
   {
     name: "xero_get_payments",
-    description: "List payments from Xero. Filter by status and date range.",
+    description:
+      "List payments from Xero. Same cost-saving modes as xero_list_bank_transactions: " +
+      "(a) unreconciledOnly=true → server fetches all pages, returns ONLY unreconciled payments (IsReconciled==false AND Status!=DELETED). Surfaces 'phantom paid' entries — invoices/bills marked as paid that were never matched to a real bank statement line. " +
+      "(b) summary=true → returns aggregate {count, totalAmount, oldestDate, newestDate, byPaymentType[], bankAccounts[]}. byPaymentType lets you split AR (ACCRECPAYMENT) vs AP (ACCPAYPAYMENT) vs credits/overpayments. " +
+      "Combine for cheap multi-tenant 'phantom payment sweep' workflows. " +
+      "When neither mode is set, behaves like a normal paginated list.",
     inputSchema: z.object({
       tenantId: tenantIdField,
       status: z.enum(["AUTHORISED", "DELETED"]).optional(),
       dateFrom: z.string().optional(),
       dateTo: z.string().optional(),
-      page: z.number().int().min(1).default(1),
+      page: z.number().int().min(1).default(1).describe("Page number (100 per page). Ignored when unreconciledOnly or summary is true (server fetches all pages)."),
+      unreconciledOnly: z.boolean().optional().describe("If true, return only entries with IsReconciled==false (excluding DELETED)."),
+      summary: z.boolean().optional().describe("If true, return aggregate counts/totals grouped by PaymentType and bank account. Massively cheaper in tokens."),
     }),
     handler: async (input) => xero.listPayments(input as Parameters<typeof xero.listPayments>[0]),
   },
