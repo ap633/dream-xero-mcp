@@ -350,10 +350,14 @@ export async function listBankTransactions(p: {
   // accept IsReconciled comparisons, so we push it down for efficiency.
   if (p.unreconciledOnly) where.push("IsReconciled==false");
 
+  // Xero's /BankTransactions endpoint applies fromDate/toDate query params to
+  // UpdatedDateUTC, NOT to the transaction's posting Date. To filter by the
+  // actual transaction date we have to push it into the where clause.
+  if (p.dateFrom) where.push(`Date >= DateTime(${formatDateForWhere(p.dateFrom)})`);
+  if (p.dateTo)   where.push(`Date <= DateTime(${formatDateForWhere(p.dateTo)})`);
+
   const baseParams: Record<string, string | number> = {};
   if (where.length) baseParams["where"] = where.join("&&");
-  if (p.dateFrom) baseParams["fromDate"] = p.dateFrom;
-  if (p.dateTo) baseParams["toDate"] = p.dateTo;
 
   // Paginated fetch helper — returns concatenated transactions across pages.
   // Only used when unreconciledOnly or summary is true (we want the full set
@@ -428,6 +432,17 @@ export async function listBankTransactions(p: {
     a.totalAmount = Math.round(a.totalAmount * 100) / 100;
   }
   return summary;
+}
+
+// Format a YYYY-MM-DD string into Xero's where-clause DateTime literal: "YYYY,M,D"
+function formatDateForWhere(isoDate: string): string {
+  // isoDate expected as "YYYY-MM-DD". Be tolerant of extra chars.
+  const m = isoDate.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (!m) return isoDate; // fall through; Xero will reject and surface the error
+  const year = parseInt(m[1], 10);
+  const month = parseInt(m[2], 10);
+  const day = parseInt(m[3], 10);
+  return `${year},${month},${day}`;
 }
 
 function parseXeroDate(raw: string | undefined): string | null {
