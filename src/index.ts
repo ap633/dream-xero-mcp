@@ -8,7 +8,7 @@ import { isOAuthMode, buildAuthorizeUrl, exchangeCodeForTokens, getTenants } fro
 
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
 const SERVER_NAME = "dream-xero-mcp";
-const SERVER_VERSION = "2.3.0";
+const SERVER_VERSION = "2.4.0";
 
 // ─── Session Store ───────────────────────────────────────────────────────────
 const transports = new Map<string, StreamableHTTPServerTransport>();

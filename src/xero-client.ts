@@ -334,13 +334,14 @@ export async function listPayments(p: {
   page?: number;
   unreconciledOnly?: boolean;
   summary?: boolean;
+  includeDeleted?: boolean;
 }) {
   const client = await getApiClient(p.tenantId);
   const where: string[] = [];
   if (p.status) where.push(`Status=="${p.status}"`);
   if (p.unreconciledOnly) {
     where.push("IsReconciled==false");
-    where.push('Status!="DELETED"');
+    if (!p.includeDeleted) where.push('Status!="DELETED"');
   }
   if (p.dateFrom) where.push(`Date >= DateTime(${formatDateForWhere(p.dateFrom)})`);
   if (p.dateTo)   where.push(`Date <= DateTime(${formatDateForWhere(p.dateTo)})`);
@@ -379,7 +380,8 @@ export async function listPayments(p: {
   }>;
 
   const filtered = p.unreconciledOnly
-    ? payments.filter((t) => t.IsReconciled === false && t.Status !== "DELETED")
+    ? payments.filter((t) => t.IsReconciled === false &&
+        (p.includeDeleted || t.Status !== "DELETED"))
     : payments;
 
   if (!p.summary) return filtered;
@@ -452,6 +454,7 @@ export async function listBankTransactions(p: {
   page?: number;
   unreconciledOnly?: boolean;
   summary?: boolean;
+  includeDeleted?: boolean;
 }) {
   const client = await getApiClient(p.tenantId);
   const where: string[] = [];
@@ -462,8 +465,10 @@ export async function listBankTransactions(p: {
   if (p.unreconciledOnly) {
     where.push("IsReconciled==false");
     // Voided/deleted bank txns can never reconcile by definition. Excluding
-    // them prevents false positives in "find data quality issues" workflows.
-    where.push('Status!="DELETED"');
+    // them prevents false positives in "find data quality issues" workflows
+    // — UNLESS the caller explicitly wants them (includeDeleted=true), e.g.
+    // for BAS review where seeing voided entries matters.
+    if (!p.includeDeleted) where.push('Status!="DELETED"');
   }
 
   // Xero's /BankTransactions endpoint applies fromDate/toDate query params to
@@ -510,8 +515,10 @@ export async function listBankTransactions(p: {
 
   // Belt-and-braces: even though we pushed IsReconciled==false to Xero, filter
   // again client-side in case Xero ignored the predicate for any reason.
+  // Honour includeDeleted: drop DELETED only when caller didn't ask for them.
   const filtered = p.unreconciledOnly
-    ? txns.filter((t) => t.IsReconciled === false)
+    ? txns.filter((t) => t.IsReconciled === false &&
+        (p.includeDeleted || (t as { Status?: string }).Status !== "DELETED"))
     : txns;
 
   if (!p.summary) return filtered;
