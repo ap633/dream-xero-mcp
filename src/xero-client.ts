@@ -1,4 +1,10 @@
 import axios, { AxiosInstance } from "axios";
+import {
+  loadStoredToken,
+  saveStoredToken,
+  clearStoredToken,
+  isPersistentStoreEnabled,
+} from "./token-store.js";
 
 const XERO_TOKEN_URL = "https://identity.xero.com/connect/token";
 const XERO_AUTHORIZE_URL = "https://login.xero.com/identity/connect/authorize";
@@ -52,9 +58,40 @@ function getScopes(): string[] {
 }
 
 let tokenCache: TokenCache | null = null;
+let tokenLoadAttempted = false; // ensures we only hit the DB once per process
+
 let tenantsCache: XeroTenant[] | null = null;
 let tenantsCacheExpiresAt = 0;
 let activeTenantId: string | null = null;
+
+// Hydrate the in-memory token cache from the persistent store (Postgres) on
+// first use. Called from getAccessToken so we don't slow down server startup
+// and so the OAuth-mode-only behaviour stays predictable.
+async function ensureTokenLoaded(): Promise<void> {
+  if (tokenLoadAttempted || !isOAuthMode()) return;
+  tokenLoadAttempted = true;
+  if (!isPersistentStoreEnabled()) return;
+  const stored = await loadStoredToken();
+  if (stored) {
+    tokenCache = {
+      accessToken: stored.accessToken,
+      expiresAt: stored.expiresAt,
+      refreshToken: stored.refreshToken,
+    };
+    console.log("✅ Loaded refresh token from persistent store");
+  }
+}
+
+async function persistCurrentToken(): Promise<void> {
+  if (!isPersistentStoreEnabled()) return;
+  if (!tokenCache?.refreshToken) return;
+  await saveStoredToken({
+    accessToken: tokenCache.accessToken,
+    refreshToken: tokenCache.refreshToken,
+    expiresAt: tokenCache.expiresAt,
+  });
+}
+
 
 async function fetchCustomConnectionToken(): Promise<string> {
   const clientId = process.env.XERO_CLIENT_ID;
@@ -126,6 +163,7 @@ export async function exchangeCodeForTokens(code: string): Promise<{
     refreshToken: refresh_token,
     expiresAt: Date.now() + (expires_in - 60) * 1000,
   };
+  await persistCurrentToken();
   // Force-refresh tenant list now that we have a fresh OAuth token
   tenantsCache = null;
   tenantsCacheExpiresAt = 0;
@@ -167,10 +205,12 @@ async function refreshOAuthToken(): Promise<string> {
     refreshToken: refresh_token || tokenCache.refreshToken,
     expiresAt: Date.now() + (expires_in - 60) * 1000,
   };
+  await persistCurrentToken();
   return access_token;
 }
 
 async function getAccessToken(): Promise<string> {
+  await ensureTokenLoaded();
   if (tokenCache && Date.now() < tokenCache.expiresAt) return tokenCache.accessToken;
   if (isOAuthMode()) return refreshOAuthToken();
   return fetchCustomConnectionToken();
@@ -720,3 +760,6 @@ export async function getOrganisationDetails(tenantId?: string) {
   const response = await client.get("/Organisation");
   return response.data.Organisations?.[0] ?? null;
 }
+
+// Re-export so callers can wipe stored tokens if needed (e.g. revocation flow)
+export { clearStoredToken };
