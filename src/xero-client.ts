@@ -326,6 +326,52 @@ interface PaymentSummary {
   bankAccounts: Array<{ accountId: string; name: string; count: number; totalAmount: number }>;
 }
 
+// Per-call cache of AccountID → Name lookups (one Accounts API call per
+// listPayments invocation, regardless of how many payments). Xero's /Payments
+// often returns Account.AccountID + Account.Code but no Account.Name —
+// especially for bank-account-targeted payments. Without enrichment the
+// downstream UI shows "Unknown" for the bank account.
+async function enrichAccountNames(
+  client: AxiosInstance,
+  payments: Array<{
+    Account?: { AccountID?: string; Name?: string; Code?: string };
+  }>
+): Promise<void> {
+  // Find AccountIDs we need to look up (have an ID but no Name)
+  const idsNeedingLookup = new Set<string>();
+  for (const p of payments) {
+    const aid = p.Account?.AccountID;
+    const aname = p.Account?.Name;
+    if (aid && (!aname || aname === "")) idsNeedingLookup.add(aid);
+  }
+  if (idsNeedingLookup.size === 0) return;
+
+  // Fetch all accounts once for this tenant. Cheap call (small response).
+  let accounts: Array<{ AccountID?: string; Name?: string; Code?: string }> = [];
+  try {
+    const resp = await client.get("/Accounts");
+    accounts = resp.data.Accounts ?? [];
+  } catch (err) {
+    // If lookup fails, just leave names blank — caller can still see AccountID
+    console.error("enrichAccountNames: failed to fetch /Accounts", err);
+    return;
+  }
+
+  // Build the lookup map
+  const idToName = new Map<string, string>();
+  for (const a of accounts) {
+    if (a.AccountID && a.Name) idToName.set(a.AccountID, a.Name);
+  }
+
+  // Mutate each payment in place to fill in the Name
+  for (const p of payments) {
+    const aid = p.Account?.AccountID;
+    if (!aid) continue;
+    const name = idToName.get(aid);
+    if (name && p.Account) p.Account.Name = name;
+  }
+}
+
 export async function listPayments(p: {
   tenantId?: string;
   status?: string;
@@ -366,7 +412,9 @@ export async function listPayments(p: {
     const response = await client.get("/Payments", {
       params: { ...baseParams, page: p.page ?? 1 },
     });
-    return response.data.Payments ?? [];
+    const fastResults = response.data.Payments ?? [];
+    await enrichAccountNames(client, fastResults);
+    return fastResults;
   }
 
   const payments = (await fetchAll()) as Array<{
@@ -383,6 +431,12 @@ export async function listPayments(p: {
     ? payments.filter((t) => t.IsReconciled === false &&
         (p.includeDeleted || t.Status !== "DELETED"))
     : payments;
+
+  // Enrich Account.Name for any payment that has an AccountID but no Name.
+  // Cheap (one /Accounts call per listPayments invocation, regardless of
+  // payment count) and benefits both the !summary path (full records returned
+  // to caller) and the summary path (bankAccounts[] in the aggregate).
+  await enrichAccountNames(client, filtered);
 
   if (!p.summary) return filtered;
 
