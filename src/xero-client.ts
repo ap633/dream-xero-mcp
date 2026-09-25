@@ -326,6 +326,70 @@ interface PaymentSummary {
   bankAccounts: Array<{ accountId: string; name: string; count: number; totalAmount: number }>;
 }
 
+function compactPayment(t: {
+  PaymentID?: string;
+  Date?: string;
+  Amount?: number;
+  IsReconciled?: boolean;
+  Status?: string;
+  PaymentType?: string;
+  Reference?: string;
+  Account?: { AccountID?: string; Name?: string; Code?: string };
+  Invoice?: {
+    InvoiceID?: string;
+    InvoiceNumber?: string;
+    Type?: string;
+    Contact?: { ContactID?: string; Name?: string };
+  };
+}): Record<string, unknown> {
+  return {
+    PaymentID: t.PaymentID,
+    Date: t.Date,
+    Amount: t.Amount,
+    IsReconciled: t.IsReconciled,
+    Status: t.Status,
+    PaymentType: t.PaymentType,
+    Reference: t.Reference,
+    AccountID: t.Account?.AccountID,
+    AccountName: t.Account?.Name,
+    AccountCode: t.Account?.Code,
+    InvoiceID: t.Invoice?.InvoiceID,
+    InvoiceNumber: t.Invoice?.InvoiceNumber,
+    InvoiceType: t.Invoice?.Type,
+    ContactID: t.Invoice?.Contact?.ContactID,
+    ContactName: t.Invoice?.Contact?.Name,
+  };
+}
+
+function compactBankTransaction(t: {
+  BankTransactionID?: string;
+  Date?: string;
+  Total?: number;
+  IsReconciled?: boolean;
+  Status?: string;
+  Type?: string;
+  Reference?: string;
+  BankAccount?: { AccountID?: string; Name?: string; Code?: string };
+  Contact?: { ContactID?: string; Name?: string };
+  LineItems?: Array<{ Description?: string; AccountCode?: string }>;
+}): Record<string, unknown> {
+  return {
+    BankTransactionID: t.BankTransactionID,
+    Date: t.Date,
+    Total: t.Total,
+    IsReconciled: t.IsReconciled,
+    Status: t.Status,
+    Type: t.Type,
+    Reference: t.Reference,
+    BankAccountID: t.BankAccount?.AccountID,
+    BankAccountName: t.BankAccount?.Name,
+    ContactID: t.Contact?.ContactID,
+    ContactName: t.Contact?.Name,
+    FirstLineDescription: t.LineItems?.[0]?.Description,
+    FirstLineAccountCode: t.LineItems?.[0]?.AccountCode,
+  };
+}
+
 // Per-call cache of AccountID → Name lookups (one Accounts API call per
 // listPayments invocation, regardless of how many payments). Xero's /Payments
 // often returns Account.AccountID + Account.Code but no Account.Name —
@@ -381,6 +445,7 @@ export async function listPayments(p: {
   unreconciledOnly?: boolean;
   summary?: boolean;
   includeDeleted?: boolean;
+  compactFields?: boolean;
 }) {
   const client = await getApiClient(p.tenantId);
   const where: string[] = [];
@@ -414,7 +479,7 @@ export async function listPayments(p: {
     });
     const fastResults = response.data.Payments ?? [];
     await enrichAccountNames(client, fastResults);
-    return fastResults;
+    return p.compactFields ? fastResults.map(compactPayment) : fastResults;
   }
 
   const payments = (await fetchAll()) as Array<{
@@ -438,7 +503,9 @@ export async function listPayments(p: {
   // to caller) and the summary path (bankAccounts[] in the aggregate).
   await enrichAccountNames(client, filtered);
 
-  if (!p.summary) return filtered;
+  if (!p.summary) {
+    return p.compactFields ? filtered.map(compactPayment) : filtered;
+  }
 
   const summary: PaymentSummary = {
     count: filtered.length,
@@ -509,6 +576,7 @@ export async function listBankTransactions(p: {
   unreconciledOnly?: boolean;
   summary?: boolean;
   includeDeleted?: boolean;
+  compactFields?: boolean;
 }) {
   const client = await getApiClient(p.tenantId);
   const where: string[] = [];
@@ -555,7 +623,8 @@ export async function listBankTransactions(p: {
     const response = await client.get("/BankTransactions", {
       params: { ...baseParams, page: p.page ?? 1 },
     });
-    return response.data.BankTransactions ?? [];
+    const fastResults = response.data.BankTransactions ?? [];
+    return p.compactFields ? fastResults.map(compactBankTransaction) : fastResults;
   }
 
   // Aggregating path: fetch all matching pages.
@@ -575,7 +644,9 @@ export async function listBankTransactions(p: {
         (p.includeDeleted || (t as { Status?: string }).Status !== "DELETED"))
     : txns;
 
-  if (!p.summary) return filtered;
+  if (!p.summary) {
+    return p.compactFields ? filtered.map(compactBankTransaction) : filtered;
+  }
 
   // Build summary
   const summary: BankTxnSummary = {

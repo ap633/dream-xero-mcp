@@ -5,10 +5,11 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID, randomBytes } from "crypto";
 import { tools } from "./tools.js";
 import { isOAuthMode, buildAuthorizeUrl, exchangeCodeForTokens, getTenants } from "./xero-client.js";
+import { checkMcpAuth, refuse, authMode } from "./mcp-auth.js";
 
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
 const SERVER_NAME = "dream-xero-mcp";
-const SERVER_VERSION = "2.5.0";
+const SERVER_VERSION = "2.6.0";
 
 // ─── Session Store ───────────────────────────────────────────────────────────
 const transports = new Map<string, StreamableHTTPServerTransport>();
@@ -58,6 +59,21 @@ function createMcpServer(): McpServer {
 const app = express();
 app.use(express.json());
 
+// The MCP endpoint and the Xero-linking pages require the token once
+// MCP_ACCESS_TOKEN is set — see mcp-auth.ts. It may be the last path segment
+// (/mcp/<token>, /auth/start/<token>) or an x-api-key / Bearer header.
+// /callback stays open: Xero redirects there, and it is guarded by the
+// one-time OAuth state.
+const guard: express.RequestHandler = (req, res, next) => {
+  const token = req.params.token;
+  const auth = checkMcpAuth(req, typeof token === "string" ? token : null);
+  if (!auth.ok) { refuse(res, auth); return; }
+  next();
+};
+
+const escapeHtml = (v: unknown) => String(v ?? "").replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string));
+
 // Health check
 app.get("/health", (_req: Request, res: Response) => {
   res.json({
@@ -74,7 +90,7 @@ app.get("/health", (_req: Request, res: Response) => {
 // GET /auth/start — kicks off the Xero OAuth consent flow.
 // Visit this in a browser to grant the app access to a Xero org.
 // Repeat for each org you want to add (Xero requires one consent per org).
-app.get("/auth/start", (_req: Request, res: Response) => {
+app.get(["/auth/start", "/auth/start/:token"], guard, (_req: Request, res: Response) => {
   if (!isOAuthMode()) {
     res.status(400).json({
       error: "OAuth mode is not enabled. Set XERO_OAUTH_CLIENT_ID and XERO_OAUTH_CLIENT_SECRET.",
@@ -109,7 +125,7 @@ app.get("/callback", async (req: Request, res: Response) => {
   const error = req.query.error as string | undefined;
 
   if (error) {
-    res.status(400).send(`<h1>Xero authorization error</h1><pre>${error}</pre>`);
+    res.status(400).send(`<h1>Xero authorization error</h1><pre>${escapeHtml(error)}</pre>`);
     return;
   }
   if (!code || !state) {
@@ -131,7 +147,7 @@ app.get("/callback", async (req: Request, res: Response) => {
         <body style="font-family: system-ui; max-width: 600px; margin: 40px auto; padding: 0 20px;">
           <h1>✅ Authorization successful</h1>
           <p>This OAuth app now has access to <strong>${result.tenantCount}</strong> Xero organisation(s).</p>
-          <p>To add another organisation, visit <a href="/auth/start">/auth/start</a> and select a different org from the Xero dropdown.</p>
+          <p>To add another organisation, visit /auth/start again (with the access token, if one is set) and select a different org from the Xero dropdown.</p>
           <p>Each new authorization is additive — Xero adds the org to your existing connections list.</p>
           <hr/>
           <p style="color: #666; font-size: 12px;">Token expires in ${result.expiresIn} seconds. Refresh tokens are stored in-memory and will survive until the next Railway redeploy.</p>
@@ -141,12 +157,12 @@ app.get("/callback", async (req: Request, res: Response) => {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error("OAuth callback error:", err);
-    res.status(500).send(`<h1>Token exchange failed</h1><pre>${message}</pre>`);
+    res.status(500).send(`<h1>Token exchange failed</h1><pre>${escapeHtml(message)}</pre>`);
   }
 });
 
 // GET /auth/status — quick way to see how many orgs are currently authorized.
-app.get("/auth/status", async (_req: Request, res: Response) => {
+app.get(["/auth/status", "/auth/status/:token"], guard, async (_req: Request, res: Response) => {
   try {
     const tenants = await getTenants();
     res.json({
@@ -171,7 +187,7 @@ app.get("/auth/status", async (_req: Request, res: Response) => {
 
 // ─── MCP Endpoint (Streamable HTTP Transport) ────────────────────────────────
 
-app.post("/mcp", async (req: Request, res: Response) => {
+app.post(["/mcp", "/mcp/:token"], guard, async (req: Request, res: Response) => {
   try {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
     let transport: StreamableHTTPServerTransport;
@@ -206,7 +222,7 @@ app.post("/mcp", async (req: Request, res: Response) => {
   }
 });
 
-app.get("/mcp", async (req: Request, res: Response) => {
+app.get(["/mcp", "/mcp/:token"], guard, async (req: Request, res: Response) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   if (!sessionId || !transports.has(sessionId)) {
     res.status(400).json({ error: "Invalid or missing session ID" });
@@ -216,7 +232,7 @@ app.get("/mcp", async (req: Request, res: Response) => {
   await transport.handleRequest(req, res);
 });
 
-app.delete("/mcp", async (req: Request, res: Response) => {
+app.delete(["/mcp", "/mcp/:token"], guard, async (req: Request, res: Response) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   if (sessionId && transports.has(sessionId)) {
     const transport = transports.get(sessionId)!;
@@ -232,6 +248,7 @@ app.listen(PORT, "0.0.0.0", () => {
   const mode = isOAuthMode() ? "OAuth (multi-tenant)" : "Custom Connection (single-tenant)";
   console.log(`✅ ${SERVER_NAME} v${SERVER_VERSION} listening on port ${PORT} — mode: ${mode}`);
   console.log(`   MCP endpoint:    /mcp`);
+  console.log(`   MCP auth: ${authMode()}`);
   console.log(`   Health check:    /health`);
   if (isOAuthMode()) {
     console.log(`   Auth start:      /auth/start`);
