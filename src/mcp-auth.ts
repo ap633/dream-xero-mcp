@@ -1,47 +1,34 @@
 // -----------------------------------------------------------------------------
-// Token protection for the MCP endpoint.
+// API key protection for the MCP endpoint and /auth/status.
 //
-// Claude connectors can only be given a URL, so the token may travel in the
-// path (/mcp/<token>). Copilot Studio sends headers, so it may also arrive as
-// "x-api-key: <token>" or "Authorization: Bearer <token>". Comparison is in
-// constant time, and repeated failures from one address are throttled.
+// The key is read from MCP_API_KEY and may arrive in any of:
+//   x-api-key: <key>              Microsoft Copilot Studio
+//   Authorization: Bearer <key>
+//   ?key=<key>                    Claude.ai custom connector (URL only)
+//   /mcp/<key>                    also URL only, kept for existing connectors
+// Comparison is in constant time, and repeated failures from one address are
+// throttled. If MCP_API_KEY is not set the protected routes fail closed (503).
 //
-//   MCP_ACCESS_TOKEN            unset  -> unchanged: open, with a warning
-//                               set    -> the token is required
-//   MCP_ALLOW_UNAUTHENTICATED   "true" -> while switching clients over, a
-//                                         request with NO token is still let
-//                                         through (a wrong token never is).
-//                                         Remove once every client is updated.
+// The key is read on every request rather than once at startup, so a missing
+// variable shows up as 503 rather than an open server, and tests can set it.
 // -----------------------------------------------------------------------------
 
 import { timingSafeEqual } from "crypto";
 import type { IncomingMessage } from "http";
 
-const TOKEN = process.env.MCP_ACCESS_TOKEN ?? "";
-const ALLOW_OPEN = /^(1|true|yes)$/i.test(process.env.MCP_ALLOW_UNAUTHENTICATED ?? "");
-
-export function authMode(): string {
-  if (!TOKEN) return "OPEN — MCP_ACCESS_TOKEN is not set; anyone with the URL can use this server";
-  if (ALLOW_OPEN) return "token accepted; requests without one still allowed (MCP_ALLOW_UNAUTHENTICATED) — remove once clients are updated";
-  return "token required";
+function apiKey(): string {
+  return process.env.MCP_API_KEY ?? "";
 }
 
-/** Is this an MCP URL ("/mcp" or "/mcp/<token>", with or without a query)? */
-export function parseMcpPath(url: string | undefined, base = "/mcp"): { isMcp: boolean; pathToken: string | null } {
-  const path = String(url ?? "").split("?")[0];
-  if (path === base || path === `${base}/`) return { isMcp: true, pathToken: null };
-  if (path.startsWith(`${base}/`)) {
-    const rest = path.slice(base.length + 1);
-    if (rest && !rest.includes("/")) {
-      try { return { isMcp: true, pathToken: decodeURIComponent(rest) }; } catch { return { isMcp: true, pathToken: rest }; }
-    }
-  }
-  return { isMcp: false, pathToken: null };
+export function authMode(): string {
+  if (!apiKey()) return "NOT CONFIGURED — MCP_API_KEY is not set; /mcp and /auth/status will return 503";
+  return "API key required";
 }
 
 function same(a: string, b: string): boolean {
   const x = Buffer.from(a);
   const y = Buffer.from(b);
+  // timingSafeEqual throws on unequal lengths, so check that first.
   return x.length === y.length && timingSafeEqual(x, y);
 }
 
@@ -63,34 +50,64 @@ function recentFailures(ip: string): number[] {
   return hits;
 }
 
+/** Forget throttled addresses (for tests). */
+export function resetAuthFailures(): void {
+  failures.clear();
+}
+
+function first(v: string | string[] | undefined): string {
+  return (Array.isArray(v) ? v[0] : v ?? "").trim();
+}
+
+/** The key the request supplied, from whichever place it used. */
+function suppliedKey(req: IncomingMessage, pathKey: string | null): string {
+  const header = first(req.headers["x-api-key"]);
+  if (header) return header;
+  const bearer = /^Bearer\s+(.+)$/i.exec(first(req.headers.authorization));
+  if (bearer) return bearer[1].trim();
+  const query = new URL(req.url ?? "/", "http://localhost").searchParams.get("key");
+  if (query) return query.trim();
+  return (pathKey ?? "").trim();
+}
+
 export type AuthResult = { ok: true } | { ok: false; status: number; message: string };
 
-/** Decide whether a request may reach the MCP server. */
-export function checkMcpAuth(req: IncomingMessage, pathToken: string | null): AuthResult {
-  if (!TOKEN) return { ok: true };
+/** Decide whether a request may reach a protected route. */
+export function checkMcpAuth(req: IncomingMessage, pathKey: string | null): AuthResult {
+  const key = apiKey();
+  if (!key) {
+    return { ok: false, status: 503, message: "Server misconfigured: MCP_API_KEY is not set." };
+  }
 
   const ip = clientIp(req);
   if (recentFailures(ip).length >= MAX_FAILURES) {
     return { ok: false, status: 429, message: "Too many failed attempts. Wait fifteen minutes and try again." };
   }
 
-  const bearer = /^Bearer\s+(.+)$/i.exec(String(req.headers.authorization ?? "").trim());
-  const apiKey = req.headers["x-api-key"];
-  const supplied = pathToken ?? (bearer ? bearer[1].trim() : (Array.isArray(apiKey) ? apiKey[0] : apiKey ?? "").trim());
-
-  if (supplied && same(supplied, TOKEN)) return { ok: true };
-  if (!supplied && ALLOW_OPEN) return { ok: true };
+  const supplied = suppliedKey(req, pathKey);
+  if (supplied && same(supplied, key)) return { ok: true };
 
   recentFailures(ip).push(Date.now());
   return {
     ok: false,
     status: 401,
-    message: "Unauthorized: use the URL ending /mcp/<token>, or send the token as \"x-api-key\" or \"Authorization: Bearer\".",
+    message: "Unauthorized: send the API key as \"x-api-key\", \"Authorization: Bearer\", or ?key=.",
   };
 }
 
 /** Write a JSON-RPC style refusal. */
 export function refuse(res: { writeHead: (s: number, h: Record<string, string>) => unknown; end: (b: string) => unknown }, r: { status: number; message: string }): void {
-  res.writeHead(r.status, { "Content-Type": "application/json", "WWW-Authenticate": 'Bearer realm="mcp"' });
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (r.status === 401) headers["WWW-Authenticate"] = 'Bearer realm="mcp"';
+  res.writeHead(r.status, headers);
   res.end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32001, message: r.message } }));
+}
+
+/** A request URL safe to log: the key is removed from the query and the path. */
+export function redactUrl(url: string | undefined): string {
+  const [path, query] = String(url ?? "").split(/\?(.*)/s, 2);
+  const safePath = path.replace(/^\/(mcp|auth\/start|auth\/status)\/[^/]+/, "/$1/[REDACTED]");
+  if (query === undefined) return safePath;
+  const safeQuery = query.replace(/(^|&)key=[^&]*/gi, "$1key=[REDACTED]");
+  return `${safePath}?${safeQuery}`;
 }
