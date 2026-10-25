@@ -881,6 +881,121 @@ export async function listManualJournals(p: { tenantId?: string; status?: string
   return response.data.ManualJournals ?? [];
 }
 
+export interface ManualJournalLineInput {
+  accountCode: string;
+  debit?: number;
+  credit?: number;
+  description?: string;
+  taxType?: string;
+  tracking?: { name: string; option: string }[];
+}
+
+export interface ManualJournalInput {
+  tenantId?: string;
+  date: string;
+  narration: string;
+  lines: ManualJournalLineInput[];
+  lineAmountTypes?: "NoTax" | "Exclusive" | "Inclusive";
+  showOnCashBasisReports?: boolean;
+}
+
+const toCents = (n: number) => Math.round(n * 100);
+
+/**
+ * Check a manual journal and build the Xero payload. Throws on anything Xero
+ * would reject or that is ambiguous. Status is always DRAFT.
+ */
+export function buildManualJournalPayload(p: ManualJournalInput) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(p.date) || Number.isNaN(Date.parse(p.date))) {
+    throw new Error(`date must be YYYY-MM-DD (got "${p.date}").`);
+  }
+  if (!p.narration?.trim()) throw new Error("narration is required.");
+  if (!Array.isArray(p.lines) || p.lines.length < 2) throw new Error("A journal needs at least two lines.");
+
+  const lineAmountTypes = p.lineAmountTypes ?? "NoTax";
+  let totalCents = 0;
+  const lines = p.lines.map((l, i) => {
+    const n = i + 1;
+    if (!l.accountCode?.trim()) throw new Error(`Line ${n}: accountCode is required.`);
+    const debit = l.debit ?? 0;
+    const credit = l.credit ?? 0;
+    if (debit < 0 || credit < 0) throw new Error(`Line ${n}: debit and credit must be positive numbers.`);
+    if ((debit > 0) === (credit > 0)) throw new Error(`Line ${n}: give a debit or a credit, not both or neither.`);
+    // Xero manual journals: positive LineAmount = debit, negative = credit.
+    const cents = debit > 0 ? toCents(debit) : -toCents(credit);
+    totalCents += cents;
+    return {
+      AccountCode: l.accountCode.trim(),
+      LineAmount: cents / 100,
+      ...(l.description ? { Description: l.description } : {}),
+      ...(l.taxType ? { TaxType: l.taxType } : {}),
+      ...(l.tracking?.length ? { Tracking: l.tracking.map((t) => ({ Name: t.name, Option: t.option })) } : {}),
+    };
+  });
+
+  // With tax, Xero balances on the tax-inclusive amounts, so leave that check to it.
+  if (lineAmountTypes === "NoTax" && totalCents !== 0) {
+    throw new Error(`Journal does not balance: debits minus credits = ${(totalCents / 100).toFixed(2)}.`);
+  }
+
+  return {
+    Date: p.date,
+    Narration: p.narration.trim(),
+    Status: "DRAFT" as const,
+    LineAmountTypes: lineAmountTypes,
+    ShowOnCashBasisReports: p.showOnCashBasisReports ?? true,
+    JournalLines: lines,
+  };
+}
+
+/** Turn a Xero 400 into a readable message listing its validation errors. */
+function xeroErrorMessage(err: unknown): string {
+  if (axios.isAxiosError(err) && err.response?.data) {
+    const data = err.response.data as {
+      Message?: string;
+      Elements?: { ValidationErrors?: { Message: string }[]; JournalLines?: { ValidationErrors?: { Message: string }[] }[] }[];
+    };
+    const messages = new Set<string>();
+    for (const el of data.Elements ?? []) {
+      for (const v of el.ValidationErrors ?? []) messages.add(v.Message);
+      for (const line of el.JournalLines ?? []) for (const v of line.ValidationErrors ?? []) messages.add(v.Message);
+    }
+    if (messages.size) return `Xero rejected the journal: ${[...messages].join("; ")}`;
+    if (data.Message) return `Xero error: ${data.Message}`;
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+
+export async function createDraftManualJournal(p: ManualJournalInput) {
+  const payload = buildManualJournalPayload(p);
+  const tid = await resolveTenantId(p.tenantId);
+  const client = await getApiClient(tid);
+  const tenantName = (await getTenants()).find((t) => t.tenantId === tid)?.tenantName ?? tid;
+
+  let created: { ManualJournalID: string; Status: string; Date: string; Narration: string } | undefined;
+  try {
+    // PUT creates only; it never updates an existing journal.
+    const response = await client.put("/ManualJournals", { ManualJournals: [payload] });
+    created = response.data.ManualJournals?.[0];
+  } catch (err) {
+    throw new Error(xeroErrorMessage(err));
+  }
+  if (!created) throw new Error("Xero did not return the created journal.");
+
+  console.log(`WRITE manual journal ${created.ManualJournalID} (${created.Status}) in "${tenantName}"`);
+  const totalDebits = payload.JournalLines.filter((l) => l.LineAmount > 0).reduce((s, l) => s + toCents(l.LineAmount), 0) / 100;
+  return {
+    organisation: tenantName,
+    manualJournalId: created.ManualJournalID,
+    status: created.Status,
+    date: payload.Date,
+    narration: created.Narration,
+    lineCount: payload.JournalLines.length,
+    totalDebits,
+    note: "Created as a DRAFT. Review and post it in Xero (Accounting → Manual journals → Draft).",
+  };
+}
+
 // ─── Repeating Invoices ──────────────────────────────────────────────────────
 export async function listRepeatingInvoices(p: { tenantId?: string; status?: string }) {
   const client = await getApiClient(p.tenantId);
