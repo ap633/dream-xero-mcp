@@ -78,6 +78,13 @@ Monthly package invoices put fees, with GST, into Income in Advance accounts: **
 
 It's split by account, and with `includeClients` (or `contact`) by client.
 
+`xero_income_in_advance_detail` shows what **one account** is made of at a date:
+- each client's invoiced, credit notes, moved to income, balance and position, with a comment;
+- the account totals, reconciled to the balance sheet;
+- the lines behind them, each with a **check**. Monthly lines are checked for service type (Tax → 804, Strategy → 805, BAS/IAS/bookkeeping/payroll → 806) and financial year. Contras are checked for GST and the income account.
+
+Without `contact`, it lists only flagged lines. With `contact` (or `allLines: true`) it lists every line. Services that aren't clearly one type (GST registration, PLSL, TPAR, ASIC, Xero) aren't type-checked.
+
 `xero_income_in_advance_audit` reads sales invoices and credit notes (from 1 Jul 2022 by default) and reports:
 
 | Issue | Severity |
@@ -88,6 +95,7 @@ It's split by account, and with `includeClients` (or `contact`) by client.
 | `over_reallocated`: more moved to income than was invoiced for that contact and account, and billing has stopped | warning |
 | `realised_ahead_of_billing`: the same, but the contact is still being invoiced, so it's a timing difference | note |
 | `possible_wrong_year`: Ignition's service text says another financial year, and that year's account exists | warning |
+| `wrong_service_type`: e.g. a BAS line in a Tax account (804) instead of BAS & BK (806) | warning |
 | `old_year_balance`: a balance left in an account three or more financial years old | warning |
 | `contra_contact_has_no_monthly_invoice`: the contra is under a different contact from the monthly invoices (best practice is the same) | note |
 | `monthly_line_straight_to_income`: a recent package invoice line coded straight to 200/202/204 | note |
