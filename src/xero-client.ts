@@ -240,7 +240,7 @@ export function getActiveTenantId(): string | null {
   return activeTenantId;
 }
 
-async function resolveTenantId(explicit?: string): Promise<string> {
+export async function resolveTenantId(explicit?: string): Promise<string> {
   if (explicit) return explicit;
   if (isOAuthMode()) {
     throw new Error("tenantId is required in OAuth mode. Use xero_list_organisations to see available tenants.");
@@ -252,7 +252,7 @@ async function resolveTenantId(explicit?: string): Promise<string> {
   return activeTenantId;
 }
 
-async function getApiClient(tenantId?: string): Promise<AxiosInstance> {
+export async function getApiClient(tenantId?: string): Promise<AxiosInstance> {
   const token = await getAccessToken();
   const tid = await resolveTenantId(tenantId);
   return axios.create({
@@ -273,8 +273,7 @@ export async function listInvoices(p: { tenantId?: string; status?: string; cont
   const where: string[] = ['Type=="ACCREC"'];
   if (p.status) where.push(`Status=="${p.status}"`);
   if (p.contactId) where.push(`Contact.ContactID=Guid("${p.contactId}")`);
-  if (p.dateFrom) query["fromDate"] = p.dateFrom;
-  if (p.dateTo) query["toDate"] = p.dateTo;
+  addDateRange(where, p.dateFrom, p.dateTo);
   if (where.length) query["where"] = where.join("&&");
   const response = await client.get("/Invoices", { params: query });
   return response.data.Invoices ?? [];
@@ -293,8 +292,7 @@ export async function listBills(p: { tenantId?: string; status?: string; contact
   const where: string[] = ['Type=="ACCPAY"'];
   if (p.status) where.push(`Status=="${p.status}"`);
   if (p.contactId) where.push(`Contact.ContactID=Guid("${p.contactId}")`);
-  if (p.dateFrom) query["fromDate"] = p.dateFrom;
-  if (p.dateTo) query["toDate"] = p.dateTo;
+  addDateRange(where, p.dateFrom, p.dateTo);
   if (where.length) query["where"] = where.join("&&");
   const response = await client.get("/Invoices", { params: query });
   return response.data.Invoices ?? [];
@@ -693,6 +691,14 @@ function formatDateForWhere(isoDate: string): string {
   return `${year},${month},${day}`;
 }
 
+// Xero's list endpoints (Invoices, CreditNotes, ManualJournals, Overpayments,
+// Prepayments) ignore fromDate/toDate query parameters; the range has to go in
+// the where clause.
+export function addDateRange(where: string[], from?: string, to?: string): void {
+  if (from) where.push(`Date>=DateTime(${formatDateForWhere(from)})`);
+  if (to) where.push(`Date<=DateTime(${formatDateForWhere(to)})`);
+}
+
 function parseXeroDate(raw: string | undefined): string | null {
   if (!raw) return null;
   const match = raw.match(/\/Date\((\d+)/);
@@ -789,9 +795,8 @@ export async function listCreditNotes(p: { tenantId?: string; status?: string; c
   const where: string[] = [];
   if (p.status) where.push(`Status=="${p.status}"`);
   if (p.contactId) where.push(`Contact.ContactID=Guid("${p.contactId}")`);
+  addDateRange(where, p.dateFrom, p.dateTo);
   if (where.length) query["where"] = where.join("&&");
-  if (p.dateFrom) query["fromDate"] = p.dateFrom;
-  if (p.dateTo) query["toDate"] = p.dateTo;
   const response = await client.get("/CreditNotes", { params: query });
   return response.data.CreditNotes ?? [];
 }
@@ -874,9 +879,8 @@ export async function listManualJournals(p: { tenantId?: string; status?: string
   const query: Record<string, string | number> = { page: p.page ?? 1 };
   const where: string[] = [];
   if (p.status) where.push(`Status=="${p.status}"`);
+  addDateRange(where, p.dateFrom, p.dateTo);
   if (where.length) query["where"] = where.join("&&");
-  if (p.dateFrom) query["fromDate"] = p.dateFrom;
-  if (p.dateTo) query["toDate"] = p.dateTo;
   const response = await client.get("/ManualJournals", { params: query });
   return response.data.ManualJournals ?? [];
 }
@@ -949,18 +953,19 @@ export function buildManualJournalPayload(p: ManualJournalInput) {
 }
 
 /** Turn a Xero 400 into a readable message listing its validation errors. */
-function xeroErrorMessage(err: unknown): string {
+export function xeroErrorMessage(err: unknown, what = "journal"): string {
   if (axios.isAxiosError(err) && err.response?.data) {
+    type Errs = { ValidationErrors?: { Message: string }[] };
     const data = err.response.data as {
       Message?: string;
-      Elements?: { ValidationErrors?: { Message: string }[]; JournalLines?: { ValidationErrors?: { Message: string }[] }[] }[];
+      Elements?: (Errs & { JournalLines?: Errs[]; LineItems?: Errs[] })[];
     };
     const messages = new Set<string>();
     for (const el of data.Elements ?? []) {
       for (const v of el.ValidationErrors ?? []) messages.add(v.Message);
-      for (const line of el.JournalLines ?? []) for (const v of line.ValidationErrors ?? []) messages.add(v.Message);
+      for (const line of [...(el.JournalLines ?? []), ...(el.LineItems ?? [])]) for (const v of line.ValidationErrors ?? []) messages.add(v.Message);
     }
-    if (messages.size) return `Xero rejected the journal: ${[...messages].join("; ")}`;
+    if (messages.size) return `Xero rejected the ${what}: ${[...messages].join("; ")}`;
     if (data.Message) return `Xero error: ${data.Message}`;
   }
   return err instanceof Error ? err.message : String(err);
@@ -1011,9 +1016,8 @@ export async function listOverpayments(p: { tenantId?: string; contactId?: strin
   const query: Record<string, string | number> = { page: p.page ?? 1 };
   const where: string[] = [];
   if (p.contactId) where.push(`Contact.ContactID=Guid("${p.contactId}")`);
+  addDateRange(where, p.dateFrom, p.dateTo);
   if (where.length) query["where"] = where.join("&&");
-  if (p.dateFrom) query["fromDate"] = p.dateFrom;
-  if (p.dateTo) query["toDate"] = p.dateTo;
   const response = await client.get("/Overpayments", { params: query });
   return response.data.Overpayments ?? [];
 }
@@ -1023,9 +1027,8 @@ export async function listPrepayments(p: { tenantId?: string; contactId?: string
   const query: Record<string, string | number> = { page: p.page ?? 1 };
   const where: string[] = [];
   if (p.contactId) where.push(`Contact.ContactID=Guid("${p.contactId}")`);
+  addDateRange(where, p.dateFrom, p.dateTo);
   if (where.length) query["where"] = where.join("&&");
-  if (p.dateFrom) query["fromDate"] = p.dateFrom;
-  if (p.dateTo) query["toDate"] = p.dateTo;
   const response = await client.get("/Prepayments", { params: query });
   return response.data.Prepayments ?? [];
 }
