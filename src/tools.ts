@@ -1,5 +1,6 @@
 import { z } from "zod";
 import * as xero from "./xero-client.js";
+import * as iia from "./income-in-advance.js";
 
 export interface ToolDefinition {
   name: string;
@@ -539,6 +540,37 @@ export const tools: ToolDefinition[] = [
     inputSchema: z.object({ tenantId: tenantIdField }),
     handler: async (input) => xero.getOrganisationDetails((input as { tenantId?: string }).tenantId),
   },
+
+  // ── Income in advance (monthly packages) ─────────────────────────────────
+  {
+    name: "xero_income_in_advance_audit",
+    description:
+      "Audit the Income in Advance accounts used for monthly packages (804.YY Tax, 805.YY Strategy, 806.YY BAS & BK, 804.5 Other; YY = financial year) and the nil-total contra invoices that move fees to income when a job goes to OFS. Returns issues — contra_has_gst, empty_contra, contra_wrong_income_account (errors); over_reallocated, possible_wrong_year, old_year_balance (warnings); contra_contact_has_no_monthly_invoice, monthly_line_straight_to_income (notes) — and the ex-GST balance left per contact and account. To check whether jobs at OFS have had their contra, compare these balances with the jobs realised at OFS. Reads many invoices; can take a minute.",
+    inputSchema: z.object({
+      tenantId: tenantIdField,
+      fromDate: z.string().optional().describe("Read invoices dated on/after this (YYYY-MM-DD). Default 2022-07-01."),
+      contact: z.string().optional().describe("Only show this contact (name contains). Also returns its balances."),
+      account: z.string().optional().describe("Only show this Income in Advance account, e.g. 804.26"),
+      includeBalances: z.boolean().optional().describe("Return every non-zero contact/account balance (default false unless contact is given)"),
+      maxIssues: z.number().int().min(1).max(1000).optional().describe("Default 150"),
+    }),
+    handler: async (input) => iia.incomeInAdvanceAudit(input as Parameters<typeof iia.incomeInAdvanceAudit>[0]),
+  },
+
+  {
+    name: "xero_prepaid_income_position",
+    description:
+      "The prepaid income (Income in Advance) position at a date, ex GST: prepaidIncomeLiability = fees billed for work not yet realised (clients in credit); realisedAheadOfBilling = work realised before its instalments were billed (clients in debit, a timing difference). Split by account, reconciled to Xero's balance sheet at the same date (notFromInvoices = manual journals/opening balances). Set includeClients or contact for the per-client breakdown. Reads all sales invoices; can take a minute.",
+    inputSchema: z.object({
+      tenantId: tenantIdField,
+      asAt: z.string().optional().describe("Position at this date, YYYY-MM-DD (default today)"),
+      contact: z.string().optional().describe("Only list this contact's balances (name contains)"),
+      includeClients: z.boolean().optional().describe("List each client's balance, largest first"),
+      maxClients: z.number().int().min(1).max(1000).optional().describe("Default 100"),
+      fromDate: z.string().optional().describe("Ignore invoices before this date (default: all)"),
+    }),
+    handler: async (input) => iia.prepaidIncomePosition(input as Parameters<typeof iia.prepaidIncomePosition>[0]),
+  },
 ];
 
 // Tools that change data in Xero. Everything here creates DRAFTS only.
@@ -571,5 +603,35 @@ export const writeTools: ToolDefinition[] = [
       showOnCashBasisReports: z.boolean().optional().describe("Default true"),
     }),
     handler: async (input) => xero.createDraftManualJournal(input as xero.ManualJournalInput),
+  },
+
+  {
+    name: "xero_create_contra_invoice",
+    description:
+      "Create a contra invoice for a monthly-package client when a job goes to OFS: a nil-total sales invoice that moves the ex-GST fee from an Income in Advance account to income, with BAS Excluded on every line (no GST — it was already reported on the monthly invoices). Approved by default, so Xero marks it Paid straight away; it is not emailed. The income account is set from the Income in Advance account (804.YY→200, 805.YY→204, 806.YY→202); for 804.5 Other you must give incomeAccount. Move the job's full fee ex GST. If that is more than has been billed so far because the work was done before the instalments finished, it is refused unless aheadOfBilling: true. Make it out to the same contact as the monthly invoices. Use preview: true first to show the user what will be created, then call again without preview once they agree.",
+    inputSchema: z.object({
+      tenantId: tenantIdField,
+      contactId: z.string().optional().describe("Xero ContactID (or give contactName)"),
+      contactName: z.string().optional().describe("Exact contact name, as on the monthly invoices"),
+      date: z.string().optional().describe("Invoice date YYYY-MM-DD (default today, Sydney time)"),
+      reference: z.string().describe('Reference, e.g. "2026 Tax Contra" or "June 2026 BAS Contra"'),
+      lines: z
+        .array(
+          z.object({
+            incomeInAdvanceAccount: z.string().describe("e.g. 804.26, 805.26, 806.26 or 804.5"),
+            amount: z.number().positive().describe("Fee to move, EX GST"),
+            incomeAccount: z.string().optional().describe("Only for 804.5 Other: the income account to move it to"),
+            description: z.string().optional().describe('Default "Reallocate <year> <Tax/Strategy/BAS & BK> fee"'),
+          })
+        )
+        .min(1),
+      approve: z.boolean().optional().describe("Default true (approved, auto-paid). false leaves it as a draft."),
+      preview: z.boolean().optional().describe("true: check everything and return what would be created, without creating it"),
+      aheadOfBilling: z
+        .boolean()
+        .optional()
+        .describe("The job was done before all its instalments were invoiced: allow moving the full fee even though less has been billed so far"),
+    }),
+    handler: async (input) => iia.createContraInvoice(input as iia.ContraInput),
   },
 ];
