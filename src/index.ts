@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID, randomBytes } from "crypto";
-import { tools } from "./tools.js";
+import { tools, writeTools } from "./tools.js";
 import { isOAuthMode, buildAuthorizeUrl, exchangeCodeForTokens, getTenants } from "./xero-client.js";
 import { checkMcpAuth, refuse, authMode, redactUrl } from "./mcp-auth.js";
 
@@ -18,7 +18,7 @@ const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 function createMcpServer(): McpServer {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
 
-  for (const tool of tools) {
+  for (const tool of [...tools, ...writeTools]) {
     server.tool(
       tool.name,
       tool.description,

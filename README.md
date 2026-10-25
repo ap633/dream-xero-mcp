@@ -46,6 +46,16 @@ Use a header where the client allows it. A key in the URL can end up in proxy or
 
 A missing or wrong key gets **401**. After 20 failures from one address in 15 minutes, that address gets **429** for the rest of the window.
 
+## Write tools
+
+These are available to every client with the key, alongside the read tools. They only ever create drafts.
+
+| Tool | What it does |
+|---|---|
+| `xero_create_manual_journal` | Creates a **draft** manual journal. Lines take a `debit` or a `credit`; with `NoTax` (the default) the journal must balance or it's rejected before reaching Xero. Never posts: someone reviews and posts it in Xero. |
+
+Each write is logged as `WRITE manual journal <id> (DRAFT) in "<organisation>"`.
+
 ## Sessions and redeploys
 
 MCP sessions are held in memory, so a redeploy forgets them. When a client sends an `mcp-session-id` the server doesn't recognise, it gets **404** (as the MCP Streamable HTTP spec says), and compliant clients start a new session automatically. An `initialize` request always creates a new session, even if it carries an old ID. **400** means the request had no session ID and wasn't an `initialize`.

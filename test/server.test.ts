@@ -158,6 +158,17 @@ describe("Sessions", () => {
   });
 });
 
+describe("Tool list", () => {
+  test("includes the read tools and xero_create_manual_journal", async () => {
+    const auth = { "x-api-key": KEY };
+    const init = await post(base, "/mcp", INITIALIZE, auth);
+    const r = await post(base, "/mcp", TOOLS_LIST, { ...auth, "mcp-session-id": init.sessionId! });
+    const names = [...r.text.matchAll(/"name":"(xero_[a-z_]+)"/g)].map((m) => m[1]);
+    assert.ok(names.includes("xero_list_manual_journals"));
+    assert.ok(names.includes("xero_create_manual_journal"));
+  });
+});
+
 describe("Open routes", () => {
   test("/health is reachable without a key", async () => {
     assert.equal((await fetch(`${base}/health`)).status, 200);

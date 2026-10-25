@@ -540,3 +540,36 @@ export const tools: ToolDefinition[] = [
     handler: async (input) => xero.getOrganisationDetails((input as { tenantId?: string }).tenantId),
   },
 ];
+
+// Tools that change data in Xero. Everything here creates DRAFTS only.
+export const writeTools: ToolDefinition[] = [
+  {
+    name: "xero_create_manual_journal",
+    description:
+      "Create a DRAFT manual journal in Xero. It is never posted: a person reviews and posts it in Xero. Each line has an accountCode and EITHER a debit OR a credit (positive numbers). With lineAmountTypes NoTax (the default) total debits must equal total credits. Use xero_list_accounts for account codes and xero_list_tracking_categories for tracking. Always confirm the organisation, date, narration and lines with the user before calling.",
+    inputSchema: z.object({
+      tenantId: tenantIdField,
+      date: z.string().describe("Journal date, YYYY-MM-DD"),
+      narration: z.string().describe("Narration shown on the journal, e.g. 'FY26 depreciation adjustment'"),
+      lines: z
+        .array(
+          z.object({
+            accountCode: z.string().describe("Account code from the chart of accounts"),
+            debit: z.number().positive().optional().describe("Debit amount (leave out for a credit line)"),
+            credit: z.number().positive().optional().describe("Credit amount (leave out for a debit line)"),
+            description: z.string().optional(),
+            taxType: z.string().optional().describe("Tax type, e.g. INPUT or OUTPUT. Only with lineAmountTypes Exclusive/Inclusive."),
+            tracking: z
+              .array(z.object({ name: z.string(), option: z.string() }))
+              .max(2)
+              .optional()
+              .describe("Tracking category name and option, up to two"),
+          })
+        )
+        .min(2),
+      lineAmountTypes: z.enum(["NoTax", "Exclusive", "Inclusive"]).optional().describe("Default NoTax"),
+      showOnCashBasisReports: z.boolean().optional().describe("Default true"),
+    }),
+    handler: async (input) => xero.createDraftManualJournal(input as xero.ManualJournalInput),
+  },
+];
