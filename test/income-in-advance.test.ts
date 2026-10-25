@@ -8,6 +8,9 @@ import {
   buildLedger,
   summarisePosition,
   balanceSheetAmounts,
+  serviceFamily,
+  checkMonthlyLine,
+  accountDetail,
   auditLedger,
   planContraLines,
   contraInvoicePayload,
@@ -30,6 +33,7 @@ const ACCOUNTS: XeroAccount[] = [
   { Code: "804.5", Name: "Income in Advance - Other", Status: "ACTIVE", Class: "LIABILITY" },
   { Code: "804.6", Name: "Get Started Fees Held", Status: "ARCHIVED", Class: "LIABILITY" },
   { Code: "805.26", Name: "Income in Advance - Strategy Appointments (2026)", Status: "ACTIVE", Class: "LIABILITY" },
+  { Code: "806.25", Name: "Income in Advance - BAS & BK (2025)", Status: "ACTIVE", Class: "LIABILITY" },
   { Code: "806.26", Name: "Income in Advance - BAS & BK (2026)", Status: "ACTIVE", Class: "LIABILITY" },
 ];
 
@@ -73,6 +77,40 @@ describe("accounts and years", () => {
     assert.equal(financialYearOf("Rental Schedule You have indicated"), null);
     assert.equal(financialYearOfDate("2026-10-26"), 2027);
     assert.equal(financialYearOfDate("2026-06-30"), 2026);
+  });
+});
+
+describe("service type", () => {
+  test("type from the service text", () => {
+    assert.equal(serviceFamily("2026 BAS Quarterly Lodgement - June We will prepare"), "806");
+    assert.equal(serviceFamily("2026 IAS Monthly Lodgement - March"), "806");
+    assert.equal(serviceFamily("Payroll & Superannuation Processing"), "806");
+    assert.equal(serviceFamily("2025 Strategy Session Quarterly - December"), "805");
+    assert.equal(serviceFamily("Business Advisory - March Quarter 2026"), "805");
+    assert.equal(serviceFamily("2026 Trust Financial Statements + Trust Tax Return"), "804");
+    assert.equal(serviceFamily("2025 Individual Tax Return + Business Schedule + GST Reconciliation"), "804");
+    assert.equal(serviceFamily("Rental Schedule You have indicated"), "804");
+    assert.equal(serviceFamily("GST Registration"), null);
+    assert.equal(serviceFamily("Taxable Payments Annual Report (TPAR)"), null);
+  });
+
+  test("a BAS line in a Tax account is the wrong type", () => {
+    const r = checkMonthlyLine("2026 BAS Quarterly Lodgement - June", iiaAccount("804.26", ACCOUNTS)!, ACCOUNTS);
+    assert.deepEqual(r.problems.map((p) => p.type), ["wrong_service_type"]);
+    assert.match(r.problems[0].detail, /belongs in 806\.26/);
+    assert.equal(r.serviceType, "BAS & BK");
+  });
+
+  test("wrong year points at that year's account of the right type", () => {
+    const r = checkMonthlyLine("2025 BAS Quarterly Lodgement - December", iiaAccount("806.25", ACCOUNTS)!, ACCOUNTS);
+    assert.deepEqual(r.problems.map((p) => p.type), ["possible_wrong_year"]);
+    assert.match(r.problems[0].detail, /belongs in 806\.26/);
+  });
+
+  test("correct lines and unclassified services raise nothing; 804.5 isn't checked", () => {
+    assert.deepEqual(checkMonthlyLine("2026 Individual Tax Return", iiaAccount("804.26", ACCOUNTS)!, ACCOUNTS).problems, []);
+    assert.deepEqual(checkMonthlyLine("GST Registration", iiaAccount("806.26", ACCOUNTS)!, ACCOUNTS).problems, []);
+    assert.deepEqual(checkMonthlyLine("2024 BAS Quarterly Lodgement - June", iiaAccount("804.5", ACCOUNTS)!, ACCOUNTS).problems, []);
   });
 });
 
@@ -129,6 +167,37 @@ describe("position", () => {
     const bas = accounts.find((a) => a.account === "806.26")!;
     assert.deepEqual([bas.prepaid, bas.realisedAheadOfBilling, bas.debitsToReview, bas.net, bas.notFromInvoices], [0, 500, 200, -700, 0]);
     assert.deepEqual(total, { prepaid: 300, realisedAheadOfBilling: 500, debitsToReview: 200, net: -400, xeroBalance: -350, notFromInvoices: 50 });
+  });
+});
+
+describe("account detail", () => {
+  test("lines, checks, client positions and totals for one account", () => {
+    const docs = [
+      monthly("804.26", 330, "2026 Individual Tax Return", { date: "2026-09-01", number: "INV-A" }),
+      monthly("804.26", 44, "2026 BAS Quarterly Lodgement - June", { date: "2026-09-01", number: "INV-B" }),
+      monthly("804.26", 110, "2026 Company Tax Return", { date: "2026-03-01", contactId: "c3", contactName: "Three" }),
+      contra("804.26", "202", 300, { date: "2026-04-01", contactId: "c3", contactName: "Three", number: "INV-C" }),
+      monthly("806.26", 999, "2026 BAS", { date: "2026-09-01" }),
+    ];
+    const d = accountDetail(docs, ACCOUNTS, "804.26", "2026-10-26");
+    assert.equal(d.lines.length, 4, "only lines in 804.26 (a contra has one line here, one in income)");
+    const bas = d.lines.find((l) => l.invoice === "INV-B")!;
+    assert.match(bas.check, /belongs in 806\.26/);
+    assert.equal(d.lines.find((l) => l.invoice === "INV-A")!.check, "OK");
+    const contraLines = d.lines.filter((l) => l.invoice === "INV-C");
+    assert.equal(contraLines[0].type, "Contra");
+    assert.match(contraLines[0].check, /should be 200/);
+    assert.equal(contraLines[0].amount, -300);
+
+    const one = d.clients.find((c) => c.contact === "Client One")!;
+    assert.deepEqual([one.balance, one.position, one.linesFlagged], [340, "prepaid", 1]);
+    const three = d.clients.find((c) => c.contact === "Three")!;
+    assert.deepEqual([three.balance, three.position, three.linesFlagged], [-200, "debit to review", 1]);
+    assert.deepEqual(d.totals, { prepaid: 340, realisedAheadOfBilling: 0, debitsToReview: 200, net: 140 });
+  });
+
+  test("refuses an account that isn't Income in Advance", () => {
+    assert.throws(() => accountDetail([], ACCOUNTS, "200", "2026-10-26"), /not an Income in Advance account/);
   });
 });
 

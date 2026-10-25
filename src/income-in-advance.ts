@@ -161,6 +161,7 @@ export type IssueType =
   | "over_reallocated"
   | "realised_ahead_of_billing"
   | "possible_wrong_year"
+  | "wrong_service_type"
   | "old_year_balance"
   | "monthly_line_straight_to_income";
 
@@ -170,6 +171,7 @@ const SEVERITY: Record<IssueType, "error" | "warning" | "note"> = {
   contra_wrong_income_account: "error",
   over_reallocated: "warning",
   possible_wrong_year: "warning",
+  wrong_service_type: "warning",
   old_year_balance: "warning",
   contra_contact_has_no_monthly_invoice: "note",
   monthly_line_straight_to_income: "note",
@@ -215,6 +217,51 @@ export function financialYearOf(description: string | undefined): number | null 
     return m >= 7 ? year + 1 : year;
   }
   return /tax return|financial statements/i.test(head) ? year : null;
+}
+
+/**
+ * Which account family a service belongs in, from its description, or null
+ * if it isn't clearly one (GST registration, PLSL, TPAR, ASIC, Xero, ...):
+ * strategy/advisory → 805, BAS/IAS/bookkeeping/payroll → 806,
+ * tax returns/financial statements/rental/CGT/amendments → 804.
+ */
+export function serviceFamily(description: string | undefined): "804" | "805" | "806" | null {
+  const head = (description ?? "").split(/\r?\n/)[0];
+  if (/strateg|business advisory|advisory session|planning session/i.test(head)) return "805";
+  if (/\b(BAS|IAS)\b|bookkeep|payroll|activity statement|PPBK/i.test(head)) return "806";
+  if (/tax return|financial statements|rental schedule|\bCGT\b|crypto|GST reconciliation|amendment|return not required|entities included/i.test(head)) return "804";
+  return null;
+}
+
+export interface LineProblem { type: "possible_wrong_year" | "wrong_service_type"; detail: string }
+
+const yy = (year: number) => String(year % 100).padStart(2, "0");
+
+/**
+ * Check one monthly-invoice line coded to a yearly Income in Advance account:
+ * is the service the right type for the account, and the right financial year?
+ * A year is only flagged when an account for that year exists (catch-up years
+ * with no account of their own can only go in the package year).
+ */
+export function checkMonthlyLine(description: string | undefined, acc: IiaAccount, accounts: XeroAccount[]) {
+  const fy = financialYearOf(description);
+  const family = serviceFamily(description);
+  const problems: LineProblem[] = [];
+  if (acc.year !== null) {
+    const own = acc.code.split(".")[0];
+    const head = (description ?? "").split(/\r?\n/)[0].slice(0, 70);
+    if (family && family !== own) {
+      problems.push({
+        type: "wrong_service_type",
+        detail: `"${head}" is ${FAMILIES[family].label} work in a ${FAMILIES[own].label} account (${acc.code}); it belongs in ${family}.${yy(acc.year)}.`,
+      });
+    }
+    const target = fy !== null ? iiaAccount(`${family ?? own}.${yy(fy)}`, accounts) : null;
+    if (fy !== null && fy !== acc.year && target) {
+      problems.push({ type: "possible_wrong_year", detail: `"${head}" looks like FY${fy} but is coded to ${acc.code} (FY${acc.year}); it belongs in ${target.code}.` });
+    }
+  }
+  return { financialYear: fy, serviceType: family ? FAMILIES[family].label : null, problems };
 }
 
 /** The financial year containing a date (FY2027 = 1 Jul 2026 – 30 Jun 2027). */
@@ -263,19 +310,8 @@ export function auditLedger(docs: XeroDoc[], accounts: XeroAccount[], today: str
 
     if (cents(d.total) <= 0 || !iiaLines.length) continue;
     for (const { l, acc } of iiaLines) {
-      if (acc!.year === null) continue;
-      const fy = financialYearOf(l.Description);
-      // Catch-up years with no account of their own (e.g. a 2021 return in a
-      // 2023 package) can only go in the package year, so they're not flagged.
-      const family = acc!.code.split(".")[0];
-      const fyAccountExists = fy !== null && iiaAccount(`${family}.${String(fy % 100).padStart(2, "0")}`, accounts) !== null;
-      if (fy !== null && fy !== acc!.year && fyAccountExists) {
-        add("possible_wrong_year", {
-          ...base,
-          account: acc!.code,
-          amount: dollars(exGstCents(l, d.lineAmountTypes)),
-          detail: `"${(l.Description ?? "").split(/\r?\n/)[0].slice(0, 70)}" looks like FY${fy} but is coded to ${acc!.code} (FY${acc!.year}).`,
-        });
+      for (const p of checkMonthlyLine(l.Description, acc!, accounts).problems) {
+        add(p.type, { ...base, account: acc!.code, amount: dollars(exGstCents(l, d.lineAmountTypes)), detail: p.detail });
       }
     }
     // Older packages coded some services straight to income by design; only
@@ -598,6 +634,154 @@ export async function prepaidIncomePosition(p: { tenantId?: string; asAt?: strin
     notes: [
       "All amounts are ex GST. prepaidIncomeLiability is fees billed for work not yet realised (clients in credit). realisedAheadOfBilling is work realised (contra done) before its instalments were billed, for clients still being invoiced (a timing difference). debitsToReview is clients in debit who haven't been invoiced on that account for over two months: not a timing difference, most likely a contra that was too large, in the wrong year or under a different contact. The balance sheet shows all three netted.",
       "notFromInvoices is the part of the balance sheet figure not explained by sales invoices, credit notes and contras: usually manual journals or opening balances. Those can't be split by client.",
+    ],
+  };
+}
+
+// ─── Detail: what one account is made of ────────────────────────────────────
+
+export interface DetailLine {
+  client: string;
+  type: "Monthly invoice" | "Credit note" | "Contra";
+  invoice: string;
+  date: string;
+  status: string;
+  reference: string;
+  service: string;
+  /** Effect on the liability, ex GST: + adds (invoices), − takes it down (contras, credit notes). */
+  amount: number;
+  financialYear: number | null;
+  serviceType: string | null;
+  check: string;
+}
+
+export type Position = "prepaid" | "realised ahead of billing" | "debit to review" | "cleared";
+
+export function positionOf(b: Balance, asAt: string): Position {
+  if (b.balance >= 0.005) return "prepaid";
+  if (b.balance <= -0.005) return stillBilling(b, asAt) ? "realised ahead of billing" : "debit to review";
+  return "cleared";
+}
+
+/** Every line in one Income in Advance account, each checked, and each client's position in it. */
+export function accountDetail(docs: XeroDoc[], accounts: XeroAccount[], code: string, asAt: string) {
+  const acc = iiaAccount(code, accounts);
+  if (!acc) throw new Error(`${code} is not an Income in Advance account (804.YY, 805.YY, 806.YY or 804.5).`);
+
+  const lines: (DetailLine & { contactId: string })[] = [];
+  for (const d of docs) {
+    if (d.date > asAt) continue;
+    const contra = isNil(d);
+    const incomeOnDoc = new Set(d.lines.filter((l) => !iiaAccount(l.AccountCode, accounts)).map((l) => l.AccountCode));
+    for (const l of d.lines) {
+      if (l.AccountCode !== code) continue;
+      const amt = dollars(exGstCents(l, d.lineAmountTypes));
+      const problems: string[] = [];
+      let fy: number | null = null;
+      let svc: string | null = null;
+      if (contra) {
+        if (l.TaxType !== "BASEXCLUDED" || cents(l.TaxAmount ?? 0) !== 0) problems.push(`Contra has GST (${l.TaxType}); should be BAS Excluded.`);
+        if (acc.income && !incomeOnDoc.has(acc.income)) problems.push(`Moved to ${[...incomeOnDoc].join("/") || "nothing"}; should be ${acc.income}.`);
+      } else if (d.kind === "invoice") {
+        const c = checkMonthlyLine(l.Description, acc, accounts);
+        fy = c.financialYear;
+        svc = c.serviceType;
+        problems.push(...c.problems.map((p) => p.detail));
+      }
+      lines.push({
+        contactId: d.contactId,
+        client: d.contactName,
+        type: d.kind === "creditnote" ? "Credit note" : contra ? "Contra" : "Monthly invoice",
+        invoice: d.number ?? "",
+        date: d.date,
+        status: d.status,
+        reference: d.reference ?? "",
+        service: (l.Description ?? "").split(/\r?\n/)[0].replace(/\s+/g, " ").trim().slice(0, 110),
+        amount: d.kind === "creditnote" ? -amt : amt,
+        financialYear: fy,
+        serviceType: svc,
+        check: problems.length ? problems.join(" ") : "OK",
+      });
+    }
+  }
+  lines.sort((a, b) => a.client.localeCompare(b.client) || a.date.localeCompare(b.date));
+
+  const flaggedBy = new Map<string, number>();
+  for (const l of lines) if (l.check !== "OK") flaggedBy.set(l.contactId, (flaggedBy.get(l.contactId) ?? 0) + 1);
+
+  const clients = buildLedger(docs, accounts, asAt)
+    .filter((b) => b.account === code && (Math.abs(b.balance) >= 0.005 || flaggedBy.has(b.contactId)))
+    .map((b) => {
+      const position = positionOf(b, asAt);
+      let comment = "";
+      if (position === "debit to review" && b.invoiced === 0) comment = "Contra under this contact; the monthly invoices are under another contact.";
+      else if (position === "debit to review") comment = "More moved to income than invoiced, and no longer being invoiced.";
+      else if (position === "prepaid" && acc.year !== null && acc.year <= financialYearOfDate(asAt) - 3) comment = "Old year still prepaid: contra not done, or the work wasn't done?";
+      return {
+        contactId: b.contactId,
+        contact: b.contact,
+        invoiced: b.invoiced,
+        credited: b.credited,
+        movedToIncome: b.reallocated,
+        balance: b.balance,
+        position,
+        lastInvoiceDate: b.lastInvoiceDate,
+        linesFlagged: flaggedBy.get(b.contactId) ?? 0,
+        comment,
+      };
+    })
+    .sort((a, b) => Math.abs(b.balance) - Math.abs(a.balance));
+
+  const sumCents = (f: (c: (typeof clients)[number]) => boolean) => clients.filter(f).reduce((s, c) => s + cents(c.balance), 0);
+  const prepaid = sumCents((c) => c.position === "prepaid");
+  // 0 − x, not −x, so an empty total is 0 rather than −0.
+  const ahead = 0 - sumCents((c) => c.position === "realised ahead of billing");
+  const review = 0 - sumCents((c) => c.position === "debit to review");
+  return {
+    account: acc,
+    totals: { prepaid: dollars(prepaid), realisedAheadOfBilling: dollars(ahead), debitsToReview: dollars(review), net: dollars(prepaid - ahead - review) },
+    clients,
+    lines,
+  };
+}
+
+export async function incomeInAdvanceDetail(p: { tenantId?: string; account: string; asAt?: string; contact?: string; allLines?: boolean; maxLines?: number }) {
+  const asAt = p.asAt ?? sydneyToday();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(asAt)) throw new Error(`asAt must be YYYY-MM-DD (got "${asAt}").`);
+  const code = p.account?.trim();
+  const tid = await resolveTenantId(p.tenantId);
+  const client = await getApiClient(tid);
+  const accounts = await fetchAccounts(client);
+  if (!iiaAccount(code, accounts)) throw new Error(`${code} is not an Income in Advance account (804.YY, 805.YY, 806.YY or 804.5).`);
+  const docs = await fetchSalesDocs(client, { toDate: asAt });
+  const report = (await getWithRetry(client, "/Reports/BalanceSheet", { date: asAt })).data.Reports?.[0] ?? null;
+  const xeroBalance = balanceSheetAmounts(report, accounts).get(code) ?? 0;
+  const detail = accountDetail(docs, accounts, code, asAt);
+
+  const forContact = (name: string) => !p.contact || name.toLowerCase().includes(p.contact.toLowerCase());
+  const clients = detail.clients.filter((c) => forContact(c.contact));
+  // A contact, or allLines: every line. Otherwise just the flagged lines.
+  const wanted = detail.lines.filter((l) => forContact(l.client) && (p.contact || p.allLines || l.check !== "OK"));
+  const maxLines = p.maxLines ?? (p.contact ? 500 : 200);
+
+  return {
+    organisation: await tenantName(tid),
+    account: detail.account.code,
+    name: detail.account.name,
+    asAt,
+    ...detail.totals,
+    balanceSheet: xeroBalance,
+    notFromInvoices: dollars(cents(xeroBalance) - cents(detail.totals.net)),
+    linesFlagged: detail.lines.filter((l) => l.check !== "OK" && forContact(l.client)).length,
+    clients: clients.map(({ contactId: _id, ...c }) => c),
+    lines: wanted.slice(0, maxLines).map(({ contactId: _id, ...l }) => l),
+    linesNotShown: Math.max(0, wanted.length - maxLines),
+    notes: [
+      "Amounts are ex GST. A client's balance = invoiced − credit notes − moved to income (contras). Positions: prepaid (in credit), realised ahead of billing (in debit, still being invoiced), debit to review (in debit, no longer invoiced).",
+      p.contact || p.allLines
+        ? "lines lists every invoice, credit note and contra line in this account."
+        : "lines lists only flagged lines; pass contact (or allLines: true) to see every line.",
+      "check tests each line: monthly lines for service type (Tax 804 / Strategy 805 / BAS & BK 806) and financial year; contras for GST and the income account. Services that aren't clearly one type (GST registration, PLSL, TPAR, ASIC, Xero, …) aren't type-checked. It can't tell whether a prepaid job has already reached OFS.",
     ],
   };
 }

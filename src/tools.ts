@@ -545,7 +545,7 @@ export const tools: ToolDefinition[] = [
   {
     name: "xero_income_in_advance_audit",
     description:
-      "Audit the Income in Advance accounts used for monthly packages (804.YY Tax, 805.YY Strategy, 806.YY BAS & BK, 804.5 Other; YY = financial year) and the nil-total contra invoices that move fees to income when a job goes to OFS. Returns issues — contra_has_gst, empty_contra, contra_wrong_income_account (errors); over_reallocated, possible_wrong_year, old_year_balance (warnings); contra_contact_has_no_monthly_invoice, monthly_line_straight_to_income (notes) — and the ex-GST balance left per contact and account. To check whether jobs at OFS have had their contra, compare these balances with the jobs realised at OFS. Reads many invoices; can take a minute.",
+      "Audit the Income in Advance accounts used for monthly packages (804.YY Tax, 805.YY Strategy, 806.YY BAS & BK, 804.5 Other; YY = financial year) and the nil-total contra invoices that move fees to income when a job goes to OFS. Returns issues — contra_has_gst, empty_contra, contra_wrong_income_account (errors); over_reallocated, possible_wrong_year, wrong_service_type, old_year_balance (warnings); contra_contact_has_no_monthly_invoice, monthly_line_straight_to_income (notes) — and the ex-GST balance left per contact and account. To check whether jobs at OFS have had their contra, compare these balances with the jobs realised at OFS. Reads many invoices; can take a minute.",
     inputSchema: z.object({
       tenantId: tenantIdField,
       fromDate: z.string().optional().describe("Read invoices dated on/after this (YYYY-MM-DD). Default 2022-07-01."),
@@ -570,6 +570,21 @@ export const tools: ToolDefinition[] = [
       fromDate: z.string().optional().describe("Ignore invoices before this date (default: all)"),
     }),
     handler: async (input) => iia.prepaidIncomePosition(input as Parameters<typeof iia.prepaidIncomePosition>[0]),
+  },
+
+  {
+    name: "xero_income_in_advance_detail",
+    description:
+      "What one Income in Advance account is made of, at a date (ex GST): each client's invoiced, credit notes, moved to income (contras), balance and position (prepaid / realised ahead of billing / debit to review), with a comment; the account totals reconciled to the balance sheet; and the lines behind them, each checked — monthly lines for service type (Tax 804 / Strategy 805 / BAS & BK 806) and financial year, contras for GST and income account. Without contact, only flagged lines are listed; give contact (or allLines: true) for every line. Use this to answer 'what is in 804.25?' or 'why does McInnes have a balance in 806.25?'.",
+    inputSchema: z.object({
+      tenantId: tenantIdField,
+      account: z.string().describe("The Income in Advance account, e.g. 804.25, 805.26, 806.26 or 804.5"),
+      asAt: z.string().optional().describe("YYYY-MM-DD (default today)"),
+      contact: z.string().optional().describe("Only this client (name contains): returns all its lines in the account"),
+      allLines: z.boolean().optional().describe("List every line, not just flagged ones (can be long)"),
+      maxLines: z.number().int().min(1).max(5000).optional().describe("Default 200 (500 with contact)"),
+    }),
+    handler: async (input) => iia.incomeInAdvanceDetail(input as Parameters<typeof iia.incomeInAdvanceDetail>[0]),
   },
 ];
 
